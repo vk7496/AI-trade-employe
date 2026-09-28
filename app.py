@@ -1,0 +1,852 @@
+import os
+import json
+from datetime import datetime
+from typing import Dict, Any, List
+
+import streamlit as st
+
+try:
+    from groq import Groq
+except ImportError:
+    Groq = None
+
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+st.set_page_config(
+    page_title="Mehr Ara AI Trade Employee",
+    page_icon="🤖",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+
+# ============================================================
+# LANGUAGE
+# ============================================================
+
+LANG = {
+    "EN": {
+        "title": "MEHR ARA AI TRADE EMPLOYEE",
+        "subtitle": "A digital commercial employee for selling, sourcing, exporting, pricing and follow-up.",
+        "today": "What do you want your digital employee to do today?",
+        "sell": "Sell a Product",
+        "source": "Source a Product",
+        "export": "Export a Product",
+        "buyers": "Find Buyers",
+        "pricing": "Calculate Price",
+        "operations": "Trade Operations",
+        "assistant": "AI Trade Employee",
+        "active_cases": "Active Cases",
+        "buyer_leads": "Buyer Leads",
+        "suppliers": "Suppliers",
+        "ai_mode": "AI Mode",
+        "demo": "Demo",
+        "groq": "Groq AI",
+        "run": "Run AI Employee",
+        "request": "Trade Request",
+        "product": "Product",
+        "quantity": "Quantity",
+        "origin": "Origin",
+        "destination": "Destination",
+        "budget": "Budget / Target Price",
+        "notes": "Additional Requirements",
+        "generate": "Generate Trade Plan",
+        "result": "AI Employee Result",
+        "chat": "Ask your AI Trade Employee",
+        "send": "Send",
+        "message": "Message",
+        "demo_notice": "Demo data is illustrative. Verify commercial information before making a transaction.",
+    },
+    "FA": {
+        "title": "نیروی هوشمند بازرگانی مهرآرا",
+        "subtitle": "یک نیروی دیجیتال برای فروش، تأمین، صادرات، قیمت‌گذاری و پیگیری امور بازرگانی.",
+        "today": "امروز می‌خواهید نیروی دیجیتال شما چه کاری انجام دهد؟",
+        "sell": "فروش کالا",
+        "source": "تأمین کالا",
+        "export": "صادرات کالا",
+        "buyers": "پیدا کردن خریدار",
+        "pricing": "محاسبه قیمت",
+        "operations": "عملیات بازرگانی",
+        "assistant": "نیروی هوشمند بازرگانی",
+        "active_cases": "پرونده‌های فعال",
+        "buyer_leads": "سرنخ‌های خریدار",
+        "suppliers": "تأمین‌کنندگان",
+        "ai_mode": "حالت AI",
+        "demo": "دمو",
+        "groq": "Groq AI",
+        "run": "اجرای نیروی هوشمند",
+        "request": "درخواست بازرگانی",
+        "product": "کالا",
+        "quantity": "مقدار",
+        "origin": "مبدأ",
+        "destination": "مقصد",
+        "budget": "بودجه / قیمت هدف",
+        "notes": "نیازمندی‌های بیشتر",
+        "generate": "ساخت برنامه بازرگانی",
+        "result": "خروجی نیروی هوشمند",
+        "chat": "از نیروی هوشمند بازرگانی بپرسید",
+        "send": "ارسال",
+        "message": "پیام",
+        "demo_notice": "اطلاعات این نسخه نمایشی و نمونه هستند. قبل از هر معامله، اطلاعات تجاری باید بررسی و تأیید شوند.",
+    },
+}
+
+
+# ============================================================
+# SESSION STATE
+# ============================================================
+
+if "language" not in st.session_state:
+    st.session_state.language = "EN"
+
+if "selected_action" not in st.session_state:
+    st.session_state.selected_action = "Sell a Product"
+
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+
+
+T = LANG[st.session_state.language]
+
+
+# ============================================================
+# CSS
+# ============================================================
+
+st.markdown(
+    """
+<style>
+
+.block-container {
+    padding-top: 1.5rem;
+    padding-bottom: 3rem;
+    max-width: 1450px;
+}
+
+.hero {
+    padding: 38px 42px;
+    border-radius: 24px;
+    background:
+        radial-gradient(circle at 85% 20%, rgba(67, 97, 238, .22), transparent 28%),
+        radial-gradient(circle at 10% 90%, rgba(0, 200, 180, .13), transparent 30%),
+        linear-gradient(135deg, #101827, #182235);
+    border: 1px solid rgba(255,255,255,.08);
+    margin-bottom: 25px;
+}
+
+.hero-title {
+    font-size: 38px;
+    font-weight: 800;
+    letter-spacing: .5px;
+    margin-bottom: 8px;
+}
+
+.hero-subtitle {
+    font-size: 17px;
+    color: #b7c2d5;
+    max-width: 900px;
+}
+
+.badge {
+    display: inline-block;
+    padding: 6px 12px;
+    border-radius: 999px;
+    background: rgba(255,255,255,.08);
+    color: #d8e2f3;
+    font-size: 12px;
+    margin-bottom: 15px;
+}
+
+.metric-card {
+    padding: 22px;
+    border-radius: 18px;
+    background: #111a29;
+    border: 1px solid rgba(255,255,255,.07);
+    min-height: 120px;
+}
+
+.metric-label {
+    color: #93a0b5;
+    font-size: 13px;
+}
+
+.metric-value {
+    font-size: 31px;
+    font-weight: 800;
+    margin-top: 8px;
+}
+
+.action-card {
+    padding: 22px;
+    border-radius: 18px;
+    background: linear-gradient(145deg,#121c2c,#182437);
+    border: 1px solid rgba(255,255,255,.07);
+    min-height: 150px;
+}
+
+.action-title {
+    font-size: 18px;
+    font-weight: 750;
+    margin-bottom: 8px;
+}
+
+.action-description {
+    font-size: 13px;
+    color: #9eabc0;
+    line-height: 1.5;
+}
+
+.section-title {
+    font-size: 24px;
+    font-weight: 750;
+    margin-top: 35px;
+    margin-bottom: 15px;
+}
+
+.result-box {
+    background: #0e1725;
+    border: 1px solid rgba(91, 123, 255, .25);
+    border-radius: 18px;
+    padding: 25px;
+    line-height: 1.7;
+}
+
+.warning-box {
+    padding: 14px 18px;
+    border-radius: 12px;
+    background: rgba(255, 193, 7, .08);
+    border: 1px solid rgba(255, 193, 7, .2);
+    color: #d9c98e;
+    margin-top: 20px;
+}
+
+.small-muted {
+    color: #8996aa;
+    font-size: 12px;
+}
+
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def get_groq_client():
+    api_key = st.secrets.get("GROQ_API_KEY", os.getenv("GROQ_API_KEY"))
+
+    if not api_key or Groq is None:
+        return None
+
+    return Groq(api_key=api_key)
+
+
+def call_groq(prompt: str) -> str:
+    client = get_groq_client()
+
+    if not client:
+        return demo_response(prompt)
+
+    model = st.secrets.get(
+        "GROQ_MODEL",
+        os.getenv("GROQ_MODEL", "llama-3.1-70b-versatile"),
+    )
+
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            temperature=0.2,
+            max_tokens=1800,
+            messages=[
+                {
+                    "role": "system",
+                    "content": """
+You are Mehr Ara AI Trade Employee.
+
+You support a commercial trading company with:
+- product sourcing
+- buyer discovery
+- export planning
+- pricing calculations
+- supplier comparison
+- trade documentation
+- commercial emails
+- follow-ups
+- risk identification
+
+Do not invent verified facts, prices, contact details, shipping costs,
+taxes or regulations.
+
+Clearly distinguish:
+1. Known information
+2. Assumptions
+3. Information that must be verified
+
+Your job is to prepare practical commercial work that a human trade
+employee can review and execute.
+""",
+                },
+                {
+                    "role": "user",
+                    "content": prompt,
+                },
+            ],
+        )
+
+        return response.choices[0].message.content
+
+    except Exception as e:
+        return (
+            "Groq AI could not be reached.\n\n"
+            f"Technical message: {str(e)}\n\n"
+            "The application has switched to Demo Mode."
+        )
+
+
+def demo_response(prompt: str) -> str:
+    return """
+### AI Trade Employee — Demo Result
+
+**Recommended workflow**
+
+1. Define the exact product specification.
+2. Confirm quantity and delivery destination.
+3. Identify suitable target markets.
+4. Build a shortlist of potential buyers or suppliers.
+5. Compare commercial terms.
+6. Calculate the indicative landed/export cost.
+7. Prepare an RFQ or buyer quotation.
+8. Prepare the required commercial documents.
+9. Flag information that needs verification.
+10. Create follow-up tasks.
+
+### Initial commercial assessment
+
+**Market:** Target market should be validated based on product,
+regulatory requirements and current demand.
+
+**Buyer/Supplier:** A verified company list should be created from
+public and authorized business sources.
+
+**Pricing:** Final pricing should only use verified purchase,
+logistics, duties/taxes and other documented costs.
+
+**Risk flags:**
+- Product specification incomplete
+- Commercial terms not yet confirmed
+- Logistics cost not verified
+- Buyer/supplier identity requires verification
+
+### Next Action
+
+Provide the real product, quantity, origin, destination and target
+commercial terms. The AI employee can then turn the request into a
+structured trade case.
+"""
+
+
+def build_trade_prompt(
+    action: str,
+    product: str,
+    quantity: str,
+    origin: str,
+    destination: str,
+    budget: str,
+    notes: str,
+) -> str:
+
+    return f"""
+Trade task:
+
+ACTION:
+{action}
+
+PRODUCT:
+{product}
+
+QUANTITY:
+{quantity}
+
+ORIGIN:
+{origin}
+
+DESTINATION:
+{destination}
+
+BUDGET / TARGET PRICE:
+{budget}
+
+ADDITIONAL REQUIREMENTS:
+{notes}
+
+Prepare a practical commercial workflow.
+
+Include:
+
+1. Executive summary
+2. Required information
+3. Market / buyer / supplier strategy
+4. Commercial calculation framework
+5. Documents required
+6. Risk flags
+7. Recommended next actions
+8. Draft RFQ or buyer message if relevant
+
+Do not invent factual contact information, market prices,
+shipping rates, taxes or regulations.
+"""
+
+
+# ============================================================
+# SIDEBAR
+# ============================================================
+
+with st.sidebar:
+
+    st.markdown("## 🤖 Mehr Ara")
+
+    language = st.selectbox(
+        "Language / زبان",
+        ["EN", "FA"],
+        index=0 if st.session_state.language == "EN" else 1,
+        key="language_selector",
+    )
+
+    if language != st.session_state.language:
+        st.session_state.language = language
+        st.rerun()
+
+    st.divider()
+
+    st.markdown("### AI Configuration")
+
+    groq_available = get_groq_client() is not None
+
+    if groq_available:
+        st.success("Groq AI Connected")
+        current_mode = T["groq"]
+    else:
+        st.info("Demo Mode")
+        current_mode = T["demo"]
+
+    st.caption(
+        "GROQ_API_KEY can be added through Streamlit Secrets."
+    )
+
+    st.divider()
+
+    st.markdown("### Trade Employee")
+
+    st.markdown(
+        """
+**Core workflows**
+
+• Sell  
+• Source  
+• Export  
+• Buyers  
+• Pricing  
+• Operations
+"""
+    )
+
+    st.divider()
+
+    st.caption("Mehr Ara AI Trade Employee")
+    st.caption("Commercial Intelligence Demo")
+
+
+# ============================================================
+# HERO
+# ============================================================
+
+st.markdown(
+    f"""
+<div class="hero">
+
+<div class="badge">AI-POWERED COMMERCIAL OPERATIONS</div>
+
+<div class="hero-title">
+{T["title"]}
+</div>
+
+<div class="hero-subtitle">
+{T["subtitle"]}
+</div>
+
+</div>
+""",
+    unsafe_allow_html=True,
+)
+
+
+# ============================================================
+# METRICS
+# ============================================================
+
+m1, m2, m3, m4 = st.columns(4)
+
+with m1:
+    st.markdown(
+        f"""
+        <div class="metric-card">
+        <div class="metric-label">{T["active_cases"]}</div>
+        <div class="metric-value">12</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+with m2:
+    st.markdown(
+        f"""
+        <div class="metric-card">
+        <div class="metric-label">{T["buyer_leads"]}</div>
+        <div class="metric-value">47</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+with m3:
+    st.markdown(
+        f"""
+        <div class="metric-card">
+        <div class="metric-label">{T["suppliers"]}</div>
+        <div class="metric-value">31</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+with m4:
+    st.markdown(
+        f"""
+        <div class="metric-card">
+        <div class="metric-label">{T["ai_mode"]}</div>
+        <div class="metric-value" style="font-size:21px;">
+        {current_mode}
+        </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+# ============================================================
+# ACTIONS
+# ============================================================
+
+st.markdown(
+    f'<div class="section-title">{T["today"]}</div>',
+    unsafe_allow_html=True,
+)
+
+
+actions = [
+    (
+        "📦",
+        T["sell"],
+        "Find markets, buyers and prepare a sales workflow.",
+    ),
+    (
+        "🔎",
+        T["source"],
+        "Find and compare potential suppliers.",
+    ),
+    (
+        "🚢",
+        T["export"],
+        "Prepare an export plan, cost structure and documents.",
+    ),
+    (
+        "🎯",
+        T["buyers"],
+        "Build a buyer discovery and outreach workflow.",
+    ),
+    (
+        "💰",
+        T["pricing"],
+        "Calculate indicative commercial pricing.",
+    ),
+    (
+        "📁",
+        T["operations"],
+        "Manage trade cases, documents and follow-ups.",
+    ),
+]
+
+
+cols = st.columns(3)
+
+for i, (icon, title, description) in enumerate(actions):
+
+    with cols[i % 3]:
+
+        st.markdown(
+            f"""
+            <div class="action-card">
+            <div style="font-size:28px;">{icon}</div>
+            <div class="action-title">{title}</div>
+            <div class="action-description">{description}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        if st.button(
+            title,
+            key=f"action_{i}",
+            use_container_width=True,
+        ):
+            st.session_state.selected_action = title
+
+
+# ============================================================
+# TRADE REQUEST
+# ============================================================
+
+st.markdown(
+    f'<div class="section-title">{T["request"]}</div>',
+    unsafe_allow_html=True,
+)
+
+selected_action = st.session_state.selected_action
+
+st.info(f"Selected workflow: **{selected_action}**")
+
+c1, c2 = st.columns(2)
+
+with c1:
+
+    product = st.text_input(
+        T["product"],
+        placeholder=(
+            "Example: Industrial Grade Material X"
+            if st.session_state.language == "EN"
+            else "مثال: ماده صنعتی X"
+        ),
+    )
+
+    quantity = st.text_input(
+        T["quantity"],
+        placeholder="Example: 5000 MT",
+    )
+
+    origin = st.text_input(
+        T["origin"],
+        placeholder="Example: China",
+    )
+
+with c2:
+
+    destination = st.text_input(
+        T["destination"],
+        placeholder="Example: Oman",
+    )
+
+    budget = st.text_input(
+        T["budget"],
+        placeholder="Example: USD 800 / MT",
+    )
+
+    notes = st.text_area(
+        T["notes"],
+        placeholder=(
+            "Payment terms, delivery time, quality requirements..."
+        ),
+        height=120,
+    )
+
+
+if st.button(
+    T["generate"],
+    type="primary",
+    use_container_width=True,
+):
+
+    prompt = build_trade_prompt(
+        selected_action,
+        product,
+        quantity,
+        origin,
+        destination,
+        budget,
+        notes,
+    )
+
+    with st.spinner("AI Trade Employee is working..."):
+
+        result = call_groq(prompt)
+
+    st.markdown(
+        f'<div class="section-title">{T["result"]}</div>',
+        unsafe_allow_html=True,
+    )
+
+    st.markdown(
+        f"""
+        <div class="result-box">
+        {result.replace(chr(10), "<br>")}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+# ============================================================
+# DEMO CASE
+# ============================================================
+
+st.markdown(
+    '<div class="section-title">Live Trade Case — Demo</div>',
+    unsafe_allow_html=True,
+)
+
+case_col1, case_col2 = st.columns([1.4, 1])
+
+with case_col1:
+
+    st.markdown(
+        """
+### Industrial Material X
+
+**Trade Case:** MA-2026-014
+
+| Field | Value |
+|---|---|
+| Quantity | 5,000 MT |
+| Origin | China |
+| Destination | Oman |
+| Payment | LC at Sight |
+| Target Delivery | ≤ 35 days |
+| Status | Supplier Shortlist |
+
+### AI Employee Tasks
+
+- Supplier discovery
+- Supplier comparison
+- Commercial terms review
+- Logistics verification
+- RFQ preparation
+- Risk identification
+- Follow-up tracking
+""",
+    )
+
+with case_col2:
+
+    st.markdown(
+        """
+### Supplier Intelligence
+
+**Supplier A**  
+China  
+MOQ: 1,000 MT  
+Lead Time: 28–35 days
+
+**Supplier B**  
+China  
+MOQ: 2,000 MT  
+Lead Time: 25–30 days
+
+**Supplier C**  
+China  
+MOQ: 5,000 MT  
+Lead Time: 30–40 days
+
+⚠️ These are demonstration records.
+
+Before any transaction, supplier identity, quotation,
+quality certificates, payment terms and logistics must be verified.
+"""
+    )
+
+
+# ============================================================
+# CHAT
+# ============================================================
+
+st.markdown(
+    f'<div class="section-title">{T["assistant"]}</div>',
+    unsafe_allow_html=True,
+)
+
+st.caption(T["chat"])
+
+for item in st.session_state.chat_history:
+
+    with st.chat_message(item["role"]):
+        st.markdown(item["content"])
+
+
+user_message = st.chat_input(
+    T["message"]
+)
+
+if user_message:
+
+    st.session_state.chat_history.append(
+        {
+            "role": "user",
+            "content": user_message,
+        }
+    )
+
+    response = call_groq(
+        f"""
+The commercial user asked:
+
+{user_message}
+
+Answer as Mehr Ara AI Trade Employee.
+
+Be practical and concise.
+
+If information is missing, clearly identify it.
+
+Never invent verified company contacts, prices,
+shipping rates or regulations.
+"""
+    )
+
+    st.session_state.chat_history.append(
+        {
+            "role": "assistant",
+            "content": response,
+        }
+    )
+
+    st.rerun()
+
+
+# ============================================================
+# FOOTER
+# ============================================================
+
+st.markdown("---")
+
+st.markdown(
+    f"""
+<div class="warning-box">
+⚠️ {T["demo_notice"]}
+</div>
+""",
+    unsafe_allow_html=True,
+)
+
+st.markdown(
+    """
+<div style="text-align:center; margin-top:25px;"
+     class="small-muted">
+Mehr Ara AI Trade Employee • Commercial Intelligence Platform
+</div>
+""",
+    unsafe_allow_html=True,
+  )
