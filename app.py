@@ -305,7 +305,7 @@ def get_groq_client():
     return Groq(api_key=api_key)
 
 
-def call_groq(prompt: str) -> str:
+def call_groq(prompt: str, language: str = "EN") -> str:
     client = get_groq_client()
 
     if not client:
@@ -316,6 +316,16 @@ def call_groq(prompt: str) -> str:
         os.getenv("GROQ_MODEL", "llama-3.1-70b-versatile"),
     )
 
+    language_instruction = (
+        "Respond entirely in Persian (Farsi), using clear and natural "
+        "business Persian. Keep numbers, currency codes (USD, MT, kg) "
+        "and document names in Latin script where that is standard "
+        "commercial practice, but all explanations, headings and labels "
+        "must be in Persian."
+        if language == "FA"
+        else "Respond entirely in English."
+    )
+
     try:
         response = client.chat.completions.create(
             model=model,
@@ -324,7 +334,7 @@ def call_groq(prompt: str) -> str:
             messages=[
                 {
                     "role": "system",
-                    "content": """
+                    "content": f"""
 You are Mehr Ara AI Trade Employee.
 
 You support a commercial trading company with:
@@ -345,6 +355,21 @@ Clearly distinguish:
 1. Known information
 2. Assumptions
 3. Information that must be verified
+
+PRICE / QUANTITY UNITS:
+Whenever a price, budget or target value is given without an explicit
+unit (for example: no clear "per kg", "per MT", "per ton" or "total
+contract value"), do NOT silently pick one. Instead:
+- State clearly, near the top of your answer, which unit you are
+  assuming and why (e.g. "Assuming the target price is per kg, since
+  the total would be unrealistic for this quantity").
+- Mark this as a "Must verify with the user before proceeding" item.
+- If the assumed unit makes the deal commercially unrealistic (far
+  above or below typical market prices), say so explicitly and
+  recommend the value be confirmed before any further calculation.
+
+LANGUAGE:
+{language_instruction}
 
 Your job is to prepare practical commercial work that a human trade
 employee can review and execute.
@@ -741,7 +766,7 @@ if st.button(
 
     with st.spinner("AI Trade Employee is working..."):
 
-        result = call_groq(prompt)
+        result = call_groq(prompt, st.session_state.language)
 
     st.markdown(
         f'<div class="section-title">{T["result"]}</div>',
@@ -865,7 +890,8 @@ If information is missing, clearly identify it.
 
 Never invent verified company contacts, prices,
 shipping rates or regulations.
-"""
+""",
+        st.session_state.language,
     )
 
     st.session_state.chat_history.append(
