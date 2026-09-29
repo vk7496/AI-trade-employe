@@ -142,6 +142,7 @@ st.markdown(
     font-weight: 800;
     letter-spacing: .5px;
     margin-bottom: 8px;
+    color: #f5f8fc;
 }
 
 .hero-subtitle {
@@ -177,6 +178,7 @@ st.markdown(
     font-size: 31px;
     font-weight: 800;
     margin-top: 8px;
+    color: #f5f8fc;
 }
 
 .action-card {
@@ -191,6 +193,7 @@ st.markdown(
     font-size: 18px;
     font-weight: 750;
     margin-bottom: 8px;
+    color: #eef3fb;
 }
 
 .action-description {
@@ -206,12 +209,67 @@ st.markdown(
     margin-bottom: 15px;
 }
 
-.result-box {
-    background: #0e1725;
-    border: 1px solid rgba(91, 123, 255, .25);
-    border-radius: 18px;
-    padding: 25px;
+/* AI result box: rendered via st.container(border=True) + st.markdown()
+   so markdown (###, **bold**, tables, lists) parses into real HTML
+   instead of showing raw symbols. This targets Streamlit's own
+   bordered-container wrapper. */
+
+[data-testid="stVerticalBlockBorderWrapper"] {
+    background: #0e1725 !important;
+    border: 1px solid rgba(91, 123, 255, .25) !important;
+    border-radius: 18px !important;
+    padding: 6px 20px 20px 20px;
+}
+
+[data-testid="stVerticalBlockBorderWrapper"] p,
+[data-testid="stVerticalBlockBorderWrapper"] li,
+[data-testid="stVerticalBlockBorderWrapper"] span {
+    color: #dce6f7 !important;
     line-height: 1.7;
+}
+
+[data-testid="stVerticalBlockBorderWrapper"] h1,
+[data-testid="stVerticalBlockBorderWrapper"] h2,
+[data-testid="stVerticalBlockBorderWrapper"] h3,
+[data-testid="stVerticalBlockBorderWrapper"] h4 {
+    color: #f5f8fc !important;
+    margin-top: 18px;
+    margin-bottom: 8px;
+}
+
+[data-testid="stVerticalBlockBorderWrapper"] strong,
+[data-testid="stVerticalBlockBorderWrapper"] b {
+    color: #ffffff !important;
+}
+
+[data-testid="stVerticalBlockBorderWrapper"] a {
+    color: #7fb3ff !important;
+}
+
+[data-testid="stVerticalBlockBorderWrapper"] code {
+    background: rgba(255,255,255,.08);
+    color: #9fd8ff !important;
+    padding: 2px 6px;
+    border-radius: 4px;
+}
+
+[data-testid="stVerticalBlockBorderWrapper"] ul,
+[data-testid="stVerticalBlockBorderWrapper"] ol {
+    padding-left: 22px;
+    margin: 8px 0;
+}
+
+[data-testid="stVerticalBlockBorderWrapper"] table {
+    color: #dce6f7 !important;
+    border-collapse: collapse;
+    width: 100%;
+    margin: 12px 0;
+}
+
+[data-testid="stVerticalBlockBorderWrapper"] table th,
+[data-testid="stVerticalBlockBorderWrapper"] table td {
+    border: 1px solid rgba(255,255,255,.12);
+    padding: 6px 10px;
 }
 
 .warning-box {
@@ -690,14 +748,8 @@ if st.button(
         unsafe_allow_html=True,
     )
 
-    st.markdown(
-        f"""
-        <div class="result-box">
-        {result.replace(chr(10), "<br>")}
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    with st.container(border=True):
+        st.markdown(result)
 
 
 # ============================================================
@@ -849,4 +901,4 @@ Mehr Ara AI Trade Employee • Commercial Intelligence Platform
 </div>
 """,
     unsafe_allow_html=True,
-  )
+    )
