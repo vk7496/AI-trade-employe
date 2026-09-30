@@ -108,6 +108,9 @@ if "selected_action" not in st.session_state:
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 
+if "last_trade_case" not in st.session_state:
+    st.session_state.last_trade_case = None
+
 
 T = LANG[st.session_state.language]
 
@@ -305,7 +308,7 @@ def get_groq_client():
     return Groq(api_key=api_key)
 
 
-def call_groq(prompt: str, language: str = "EN") -> str:
+def call_groq(prompt: str, language: str = "EN", history: list = None) -> str:
     client = get_groq_client()
 
     if not client:
@@ -326,15 +329,10 @@ def call_groq(prompt: str, language: str = "EN") -> str:
         else "Respond entirely in English."
     )
 
-    try:
-        response = client.chat.completions.create(
-            model=model,
-            temperature=0.2,
-            max_tokens=1800,
-            messages=[
-                {
-                    "role": "system",
-                    "content": f"""
+    messages = [
+        {
+            "role": "system",
+            "content": f"""
 You are Mehr Ara AI Trade Employee.
 
 You support a commercial trading company with:
@@ -374,12 +372,20 @@ LANGUAGE:
 Your job is to prepare practical commercial work that a human trade
 employee can review and execute.
 """,
-                },
-                {
-                    "role": "user",
-                    "content": prompt,
-                },
-            ],
+        }
+    ]
+
+    if history:
+        messages.extend(history)
+
+    messages.append({"role": "user", "content": prompt})
+
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            temperature=0.2,
+            max_tokens=1800,
+            messages=messages,
         )
 
         return response.choices[0].message.content
@@ -768,6 +774,17 @@ if st.button(
 
         result = call_groq(prompt, st.session_state.language)
 
+    st.session_state.last_trade_case = {
+        "action": selected_action,
+        "product": product,
+        "quantity": quantity,
+        "origin": origin,
+        "destination": destination,
+        "budget": budget,
+        "notes": notes,
+        "result": result,
+    }
+
     st.markdown(
         f'<div class="section-title">{T["result"]}</div>',
         unsafe_allow_html=True,
@@ -876,8 +893,35 @@ if user_message:
         }
     )
 
+    context_note = ""
+
+    if st.session_state.last_trade_case:
+        tc = st.session_state.last_trade_case
+        context_note = f"""
+Context: the AI employee already generated a trade plan for this case
+earlier in this session. Use it to answer follow-up questions about
+this case unless the user clearly asks about something unrelated.
+
+Action: {tc["action"]}
+Product: {tc["product"]}
+Quantity: {tc["quantity"]}
+Origin: {tc["origin"]}
+Destination: {tc["destination"]}
+Budget / Target Price: {tc["budget"]}
+Additional Requirements: {tc["notes"]}
+
+Full previously generated plan:
+{tc["result"]}
+"""
+
+    # Prior turns (everything before the message just appended above),
+    # capped to keep the request small.
+    prior_turns = st.session_state.chat_history[:-1][-8:]
+
     response = call_groq(
         f"""
+{context_note}
+
 The commercial user asked:
 
 {user_message}
@@ -892,6 +936,7 @@ Never invent verified company contacts, prices,
 shipping rates or regulations.
 """,
         st.session_state.language,
+        prior_turns,
     )
 
     st.session_state.chat_history.append(
@@ -927,4 +972,4 @@ Mehr Ara AI Trade Employee • Commercial Intelligence Platform
 </div>
 """,
     unsafe_allow_html=True,
-    )
+)
