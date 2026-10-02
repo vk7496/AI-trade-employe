@@ -309,7 +309,7 @@ def call_groq(prompt: str, language: str = "EN", history: list = None) -> str:
 
     model = st.secrets.get(
         "OPENROUTER_MODEL",
-        os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.1-70b-instruct"),
+        os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.1-8b-instruct:free"),
     )
 
     language_instruction = (
@@ -978,4 +978,4 @@ Mehr Ara AI Trade Employee • Commercial Intelligence Platform
 </div>
 """,
     unsafe_allow_html=True,
-    )
+)
