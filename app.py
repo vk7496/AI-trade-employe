@@ -4,11 +4,9 @@ from datetime import datetime
 from typing import Dict, Any, List
 
 import streamlit as st
+import httpx
 
-try:
-    from groq import Groq
-except ImportError:
-    Groq = None
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 
 # ============================================================
@@ -44,7 +42,7 @@ LANG = {
         "suppliers": "Suppliers",
         "ai_mode": "AI Mode",
         "demo": "Demo",
-        "groq": "Groq AI",
+        "groq": "OpenRouter AI",
         "run": "Run AI Employee",
         "request": "Trade Request",
         "product": "Product",
@@ -76,7 +74,7 @@ LANG = {
         "suppliers": "تأمین‌کنندگان",
         "ai_mode": "حالت AI",
         "demo": "دمو",
-        "groq": "Groq AI",
+        "groq": "OpenRouter AI",
         "run": "اجرای نیروی هوشمند",
         "request": "درخواست بازرگانی",
         "product": "کالا",
@@ -299,24 +297,19 @@ st.markdown(
 # HELPERS
 # ============================================================
 
-def get_groq_client():
-    api_key = st.secrets.get("GROQ_API_KEY", os.getenv("GROQ_API_KEY"))
-
-    if not api_key or Groq is None:
-        return None
-
-    return Groq(api_key=api_key)
+def get_openrouter_key():
+    return st.secrets.get("OPENROUTER_API_KEY", os.getenv("OPENROUTER_API_KEY"))
 
 
 def call_groq(prompt: str, language: str = "EN", history: list = None) -> str:
-    client = get_groq_client()
+    api_key = get_openrouter_key()
 
-    if not client:
+    if not api_key:
         return demo_response(prompt)
 
     model = st.secrets.get(
-        "GROQ_MODEL",
-        os.getenv("GROQ_MODEL", "llama-3.1-70b-versatile"),
+        "OPENROUTER_MODEL",
+        os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.1-70b-instruct"),
     )
 
     language_instruction = (
@@ -381,18 +374,31 @@ employee can review and execute.
     messages.append({"role": "user", "content": prompt})
 
     try:
-        response = client.chat.completions.create(
-            model=model,
-            temperature=0.2,
-            max_tokens=1800,
-            messages=messages,
-        )
-
-        return response.choices[0].message.content
+        with httpx.Client(timeout=60) as http_client:
+            response = http_client.post(
+                OPENROUTER_URL,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                    # OpenRouter asks for these two for routing/analytics;
+                    # harmless to omit, but recommended.
+                    "HTTP-Referer": "https://mehrara.streamlit.app",
+                    "X-Title": "Mehr Ara AI Trade Employee",
+                },
+                json={
+                    "model": model,
+                    "temperature": 0.2,
+                    "max_tokens": 1800,
+                    "messages": messages,
+                },
+            )
+            response.raise_for_status()
+            data = response.json()
+            return data["choices"][0]["message"]["content"]
 
     except Exception as e:
         return (
-            "Groq AI could not be reached.\n\n"
+            "AI service could not be reached.\n\n"
             f"Technical message: {str(e)}\n\n"
             "The application has switched to Demo Mode."
         )
@@ -515,17 +521,17 @@ with st.sidebar:
 
     st.markdown("### AI Configuration")
 
-    groq_available = get_groq_client() is not None
+    ai_available = get_openrouter_key() is not None
 
-    if groq_available:
-        st.success("Groq AI Connected")
+    if ai_available:
+        st.success("OpenRouter AI Connected")
         current_mode = T["groq"]
     else:
         st.info("Demo Mode")
         current_mode = T["demo"]
 
     st.caption(
-        "GROQ_API_KEY can be added through Streamlit Secrets."
+        "OPENROUTER_API_KEY can be added through Streamlit Secrets."
     )
 
     st.divider()
@@ -972,4 +978,4 @@ Mehr Ara AI Trade Employee • Commercial Intelligence Platform
 </div>
 """,
     unsafe_allow_html=True,
-)
+    )
