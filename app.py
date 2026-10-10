@@ -1,21 +1,9 @@
 import os
 import re
-from io import BytesIO
-from datetime import date
-from urllib.parse import quote
 from typing import Optional, Tuple
 
 import httpx
 import streamlit as st
-
-from reportlab.lib import colors
-from reportlab.lib.enums import TA_LEFT, TA_RIGHT
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.units import mm
-from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.ttfonts import TTFont
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 
 # ============================================================
 # MEHR ARA AI TRADE EMPLOYEE
@@ -90,8 +78,7 @@ for key, default in {
     "last_model": None,
     "research_result": None,
     "calc_result": None,
-    "invoice_generated": False,
-    "invoice_docs": None,
+    "market_price_result": None,
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
@@ -136,158 +123,6 @@ def money(x: float, currency: str = "USD") -> str:
 
 def pct(x: float) -> str:
     return f"{x:.2f}%"
-
-
-def find_pdf_font():
-    candidates = [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/dejavu/DejaVuSans.ttf",
-    ]
-    for path in candidates:
-        if os.path.exists(path):
-            return path
-    return None
-
-
-def build_invoice_pdf(kind: str, invoice_no: str, party_name: str, party_address: str,
-                      seller_name: str, seller_address: str, product: str, quantity: str,
-                      unit_price: float, total: float, currency: str, incoterm: str,
-                      payment: str, validity: str, notes: str, language: str = "FA") -> bytes:
-    """Create a professional PDF. Labels are bilingual; user data remains as entered."""
-    buffer = BytesIO()
-    doc = SimpleDocTemplate(
-        buffer, pagesize=A4, rightMargin=16*mm, leftMargin=16*mm,
-        topMargin=15*mm, bottomMargin=15*mm,
-        title=f"Mehr Ara - {kind} - {invoice_no}",
-        author="Mehr Ara AI Trade Employee",
-    )
-
-    font_name = "Helvetica"
-    font_bold = "Helvetica-Bold"
-    font_path = find_pdf_font()
-    if font_path:
-        try:
-            pdfmetrics.registerFont(TTFont("MehrAraSans", font_path))
-            font_name = "MehrAraSans"
-            font_bold = "MehrAraSans"
-        except Exception:
-            pass
-
-    styles = getSampleStyleSheet()
-    title = ParagraphStyle("InvoiceTitle", parent=styles["Title"], fontName=font_bold,
-                           fontSize=18, leading=22, textColor=colors.HexColor("#172B4D"),
-                           spaceAfter=8)
-    h = ParagraphStyle("InvoiceH", parent=styles["Heading2"], fontName=font_bold,
-                       fontSize=10.5, leading=14, textColor=colors.HexColor("#172B4D"),
-                       spaceBefore=8, spaceAfter=5)
-    body = ParagraphStyle("InvoiceBody", parent=styles["BodyText"], fontName=font_name,
-                          fontSize=8.8, leading=13, textColor=colors.HexColor("#263445"))
-    small = ParagraphStyle("InvoiceSmall", parent=body, fontSize=7.5, leading=10)
-    right = ParagraphStyle("InvoiceRight", parent=body, alignment=TA_RIGHT)
-
-    def P(text, style=body):
-        return Paragraph(str(text).replace("&", "&amp;"), style)
-
-    story = []
-    story.append(P("MEHR ARA BUSINESS", title))
-    story.append(P(f"{kind} / سند بازرگانی", h))
-    story.append(Spacer(1, 3*mm))
-
-    meta = [
-        [P("Document No. / شماره سند", small), P(invoice_no, body),
-         P("Date / تاریخ", small), P(str(date.today()), body)],
-        [P("Status / وضعیت", small), P("Prepared for confirmation / آماده تأیید", body),
-         P("Currency / ارز", small), P(currency, body)],
-    ]
-    t = Table(meta, colWidths=[35*mm, 55*mm, 35*mm, 45*mm])
-    t.setStyle(TableStyle([
-        ("GRID", (0,0), (-1,-1), 0.35, colors.HexColor("#D8E0EA")),
-        ("BACKGROUND", (0,0), (0,-1), colors.HexColor("#F4F7FA")),
-        ("BACKGROUND", (2,0), (2,-1), colors.HexColor("#F4F7FA")),
-        ("VALIGN", (0,0), (-1,-1), "TOP"),
-        ("LEFTPADDING", (0,0), (-1,-1), 5), ("RIGHTPADDING", (0,0), (-1,-1), 5),
-    ]))
-    story.append(t)
-
-    story.append(P("Parties / طرفین", h))
-    parties = [
-        [P("Seller / فروشنده", small), P(seller_name or "—", body),
-         P("Buyer / خریدار", small), P(party_name or "—", body)],
-        [P("Seller address", small), P(seller_address or "—", body),
-         P("Buyer address", small), P(party_address or "—", body)],
-    ]
-    pt = Table(parties, colWidths=[31*mm, 59*mm, 31*mm, 49*mm])
-    pt.setStyle(TableStyle([
-        ("GRID", (0,0), (-1,-1), 0.35, colors.HexColor("#D8E0EA")),
-        ("BACKGROUND", (0,0), (0,-1), colors.HexColor("#F4F7FA")),
-        ("BACKGROUND", (2,0), (2,-1), colors.HexColor("#F4F7FA")),
-        ("VALIGN", (0,0), (-1,-1), "TOP"),
-        ("LEFTPADDING", (0,0), (-1,-1), 5), ("RIGHTPADDING", (0,0), (-1,-1), 5),
-    ]))
-    story.append(pt)
-
-    story.append(P("Commercial Details / جزئیات تجاری", h))
-    line_total = total
-    item = [[P("#", small), P("Product / کالا", small), P("Quantity / مقدار", small),
-             P("Unit Price / قیمت واحد", small), P("Line Total / مبلغ", small)],
-            [P("1", body), P(product or "—", body), P(quantity or "—", body),
-             P(money(unit_price, currency), body), P(money(line_total, currency), body)]]
-    it = Table(item, colWidths=[10*mm, 65*mm, 35*mm, 37*mm, 37*mm])
-    it.setStyle(TableStyle([
-        ("GRID", (0,0), (-1,-1), 0.45, colors.HexColor("#BFCAD7")),
-        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#EAF0F6")),
-        ("FONTNAME", (0,0), (-1,0), font_bold),
-        ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
-        ("LEFTPADDING", (0,0), (-1,-1), 5), ("RIGHTPADDING", (0,0), (-1,-1), 5),
-    ]))
-    story.append(it)
-
-    story.append(Spacer(1, 4*mm))
-    summary = [
-        [P("Total / جمع", h), P(money(total, currency), ParagraphStyle("sum", parent=body, fontName=font_bold, fontSize=12, textColor=colors.HexColor("#172B4D")))],
-        [P("Incoterm / اینکوترمز", small), P(incoterm or "To be confirmed", body)],
-        [P("Payment / پرداخت", small), P(payment or "To be confirmed", body)],
-        [P("Validity / اعتبار", small), P(validity or "To be confirmed", body)],
-    ]
-    st = Table(summary, colWidths=[65*mm, 119*mm])
-    st.setStyle(TableStyle([
-        ("GRID", (0,0), (-1,-1), 0.35, colors.HexColor("#D8E0EA")),
-        ("BACKGROUND", (0,0), (0,-1), colors.HexColor("#F4F7FA")),
-        ("VALIGN", (0,0), (-1,-1), "TOP"),
-        ("LEFTPADDING", (0,0), (-1,-1), 6), ("RIGHTPADDING", (0,0), (-1,-1), 6),
-    ]))
-    story.append(st)
-
-    if notes:
-        story.append(P("Notes / توضیحات", h))
-        story.append(P(notes, body))
-
-    story.append(Spacer(1, 7*mm))
-    story.append(P(
-        "Important: This document is a commercial draft generated by Mehr Ara AI Trade Employee. "
-        "Final legal, tax, customs, banking and accounting details must be reviewed and approved by an authorized person before issuance.",
-        small,
-    ))
-    doc.build(story)
-    return buffer.getvalue()
-
-
-def whatsapp_link(phone: str, message: str) -> Optional[str]:
-    digits = re.sub(r"\D", "", normalize_digits(phone or ""))
-    if not digits:
-        return None
-    return f"https://wa.me/{digits}?text={quote(message)}"
-
-
-def invoice_message(kind: str, invoice_no: str, product: str, total: float, currency: str,
-                    incoterm: str, payment: str, language: str) -> str:
-    if language == "FA":
-        return (f"سلام،\n\nسند بازرگانی {kind} شماره {invoice_no} مربوط به {product} آماده بررسی است.\n"
-                f"مبلغ: {money(total, currency)}\nاینکوترمز: {incoterm or 'تأیید شود'}\n"
-                f"شرایط پرداخت: {payment or 'تأیید شود'}\n\nلطفاً جزئیات را بررسی و تأیید فرمایید.")
-    return (f"Hello,\n\nThe {kind} {invoice_no} for {product} is ready for review.\n"
-            f"Total: {money(total, currency)}\nIncoterm: {incoterm or 'TBC'}\n"
-            f"Payment: {payment or 'TBC'}\n\nPlease review and confirm the commercial details.")
 
 
 def demo_response(language: str) -> str:
@@ -408,6 +243,63 @@ def call_ai(prompt: str, language: str, history=None, web_search=False) -> str:
     st.session_state.last_model = None
     st.session_state.last_error = " | ".join(errors)
     return demo_response(language)
+
+
+def extract_market_price(text: str):
+    """Extract a deliberately machine-readable USD/kg market benchmark from the research response.
+    We never invent a number here: if the AI/web research does not provide the marker, return None.
+    """
+    if not text:
+        return None
+    m = re.search(r"MARKET_PRICE_RANGE_USD_PER_KG\s*:\s*\$?\s*([0-9][0-9,]*(?:\.\d+)?)\s*(?:-|–|—|to)\s*\$?\s*([0-9][0-9,]*(?:\.\d+)?)", text, re.I)
+    if not m:
+        return None
+    try:
+        low = float(m.group(1).replace(",", ""))
+        high = float(m.group(2).replace(",", ""))
+    except ValueError:
+        return None
+    if low < 0 or high < low:
+        return None
+    return {"low": low, "high": high, "mid": (low + high) / 2.0}
+
+
+def market_price_research(product: str, quantity: str, origin: str, destination: str, language: str) -> str:
+    """Live market-price research. Groq GPT-OSS browser search is used; no hard-coded price is used."""
+    prompt = f"""You are the live market-pricing researcher for Mehr Ara AI Trade Employee.
+
+Research the CURRENT 2026 wholesale/B2B market price for this trade request:
+Product: {product or 'Not provided'}
+Quantity: {quantity or 'Not provided'}
+Origin: {origin or 'Not provided'}
+Destination: {destination or 'Not provided'}
+
+Use browser search and prioritize:
+1) recent supplier quotations/listings for the same product and grade;
+2) credible trade-market sources;
+3) official trade statistics such as UN Comtrade/WITS as a historical benchmark, clearly labeled as historical/unit-value data.
+
+Rules:
+- Do NOT invent a price.
+- Do NOT mix retail per-gram prices with wholesale per-kg prices.
+- Do NOT treat an old trade statistic as today's quotation.
+- If the product is saffron, distinguish Super Negin/Negin/Sargol/Pushal and only use the requested grade when it is known. If grade is missing, explicitly say that grade is required and give separate ranges only when sources support them.
+- Prefer at least two independent current/recent sources when available.
+- State Incoterm for every direct quotation (EXW/FOB/CIF/etc.). Never convert EXW/FOB/CIF into another Incoterm unless a documented cost supports the conversion.
+- The result is a MARKET BENCHMARK, not a confirmed supplier quotation.
+
+At the end, output EXACTLY one machine-readable line in this format if a defensible wholesale range is available:
+MARKET_PRICE_RANGE_USD_PER_KG: <low>-<high>
+If no defensible USD/kg range is available, output:
+MARKET_PRICE_RANGE_USD_PER_KG: UNAVAILABLE
+
+Then output:
+MARKET_PRICE_BASIS: <one sentence explaining the basis and Incoterm>
+MARKET_PRICE_CONFIDENCE: HIGH|MEDIUM|LOW
+
+Also provide a short readable explanation with source names/URLs and the date of each relevant source.
+{clean_farsi_prompt(language)}"""
+    return call_ai(prompt, language, web_search=True)
 
 # ------------------------- deterministic calculator ----------
 def calculate_price(quantity, unit_purchase, inland, freight, insurance, duty_pct, vat_pct, bank_pct, other, margin_pct):
@@ -581,6 +473,25 @@ with c2:
     notes=st.text_area(T["notes"],placeholder="پرداخت، زمان تحویل، کیفیت، بسته‌بندی، Incoterm..." if st.session_state.language=="FA" else "Payment, delivery, quality, packaging, Incoterm...",height=115)
 
 if st.button(T["generate"],type="primary",use_container_width=True):
+    market_text = ""
+    market_data = None
+    # When a product/quantity is supplied, obtain a live market benchmark first.
+    # This is intentionally separate from the LLM's prose so the calculator can use a traced number.
+    if product and quantity and groq_ready:
+        with st.spinner("در حال جستجوی قیمت فعلی بازار..." if st.session_state.language=="FA" else "Researching the current market price..."):
+            market_text = market_price_research(product, quantity, origin, destination, st.session_state.language)
+        market_data = extract_market_price(market_text)
+        st.session_state.market_price_result = {"text": market_text, "data": market_data, "product": product, "quantity": quantity, "destination": destination}
+        if market_data:
+            # Feed ONLY the researched midpoint into the deterministic calculator.
+            # User-entered calculator values remain untouched once the user has explicitly entered one.
+            if not str(st.session_state.get("calc_unit", "")).strip():
+                st.session_state["calc_unit"] = f"{market_data['mid']:.2f} USD/kg"
+            if not str(st.session_state.get("calc_qty", "")).strip() or str(st.session_state.get("calc_qty", "")).strip() in {"20", "30"}:
+                parsed_q = parse_number(quantity)
+                if parsed_q:
+                    st.session_state["calc_qty"] = str(parsed_q)
+
     prompt=f"""Trade case for Mehr Ara:
 Workflow: {st.session_state.selected_action}
 Product: {product or 'Not provided'}
@@ -590,23 +501,41 @@ Destination: {destination or 'Not provided'}
 Budget / target: {budget or 'Not provided'}
 Additional requirements: {notes or 'Not provided'}
 
+LIVE MARKET PRICE RESEARCH:
+{market_text or 'No live market price research was available. Do not invent a price.'}
+
+If the live research contains MARKET_PRICE_RANGE_USD_PER_KG, use that range as the market benchmark. Do not replace it with the user's budget. The budget is a constraint, not evidence of market price.
+
 {clean_farsi_prompt(st.session_state.language)}
 
 Create an operational report with:
 1. Executive summary / خلاصه مدیریتی
 2. Known facts vs assumptions vs must-verify table
 3. Unit and quantity ambiguity check
-4. Buyer/supplier strategy
-5. Deterministic pricing inputs required
-6. Customs, HS Code and import-compliance checklist for the destination
-7. Risks and mitigations
-8. 5–7 day action plan
-9. Draft RFQ/commercial message
-10. Three next actions
+4. CURRENT MARKET PRICE BENCHMARK: show price/kg, source basis, date and Incoterm; distinguish benchmark from confirmed quotation
+5. Compare the user's budget with the market benchmark if a budget was supplied
+6. Buyer/supplier strategy
+7. Deterministic pricing inputs required
+8. Customs, HS Code and import-compliance checklist for the destination
+9. Risks and mitigations
+10. 5–7 day action plan
+11. Draft RFQ/commercial message
+12. Three next actions
 
-For current regulatory or company information, say that live research is required; do not fabricate it."""
+Never invent missing freight, duty, VAT, stock, contact details or quotation values.
+For current regulatory or company information, use live research and cite the source."""
     with st.spinner(T["working"]):
-        result=call_ai(prompt,st.session_state.language)
+        result=call_ai(prompt,st.session_state.language,web_search=bool(groq_ready))
+    if market_data:
+        benchmark = (
+            f"\n\n### {'بنچمارک قیمت بازار' if st.session_state.language=='FA' else 'Current Market Price Benchmark'}\n"
+            f"**USD {market_data['low']:,.0f}–{market_data['high']:,.0f} / kg** "
+            f"(midpoint: **USD {market_data['mid']:,.0f}/kg**)\n\n"
+            f"For **{parse_number(quantity) or quantity} kg**, indicative goods value = "
+            f"**USD {(parse_number(quantity) or 0)*market_data['low']:,.0f}–{(parse_number(quantity) or 0)*market_data['high']:,.0f}**.\n\n"
+            f"> This is a live market benchmark from web research, not a confirmed supplier quotation. Verify grade, specification, Incoterm, packaging and supplier quote before issuing an invoice."
+        )
+        result = result + benchmark
     st.session_state.last_trade_case={"action":st.session_state.selected_action,"product":product,"quantity":quantity,"origin":origin,"destination":destination,"budget":budget,"notes":notes,"result":result}
     st.session_state["show_latest_result"]=True
 
@@ -617,6 +546,28 @@ if st.session_state.get("show_latest_result") and st.session_state.last_trade_ca
         model=st.session_state.last_model or ""
         st.caption(f"🤖 AI Provider: {provider} • {model}" if model else f"🤖 AI Provider: {provider}")
         st.markdown(st.session_state.last_trade_case["result"])
+
+# ---------------------- market price benchmark ----------------
+if st.session_state.get("market_price_result"):
+    mp = st.session_state.market_price_result
+    st.markdown('<div class="section-title">Live Market Price Benchmark</div>', unsafe_allow_html=True)
+    with st.container(border=True):
+        if mp.get("data"):
+            d = mp["data"]
+            qty = parse_number(mp.get("quantity", ""))
+            total_low = d["low"] * qty if qty else None
+            total_high = d["high"] * qty if qty else None
+            if st.session_state.language == "FA":
+                st.markdown(f"**بازه فعلی بازار: USD {d['low']:,.0f} تا USD {d['high']:,.0f} به ازای هر کیلو**")
+                if qty:
+                    st.markdown(f"برای **{qty:g} کیلو**: حدود **USD {total_low:,.0f} تا USD {total_high:,.0f}** فقط ارزش کالا.")
+                st.caption("این عدد بنچمارک تحقیق بازار است، نه quotation قطعی تأمین‌کننده. مبنای قیمت و Incoterm باید بررسی شود.")
+            else:
+                st.markdown(f"**Current market range: USD {d['low']:,.0f}–USD {d['high']:,.0f} per kg**")
+                if qty:
+                    st.markdown(f"For **{qty:g} kg**: approximately **USD {total_low:,.0f}–USD {total_high:,.0f}** for goods value only.")
+                st.caption("This is a market benchmark, not a confirmed supplier quotation. Verify source, grade/specification and Incoterm.")
+        st.markdown(mp.get("text", ""))
 
 # -------------------------- calculator ------------------------
 st.markdown(f'<div class="section-title">{T["pricing_title"]}</div>',unsafe_allow_html=True)
@@ -650,78 +601,6 @@ if st.session_state.calc_result:
             st.warning(err)
         else:
             st.markdown(calculator_markdown(calc,st.session_state.language))
-
-# --------------------- document / invoice center ----------------
-st.markdown("<div class='section-title'>📄 سند و فاکتور تجاری / Commercial Documents</div>", unsafe_allow_html=True)
-st.caption(
-    "بعد از تأیید قیمت، مقدار، طرفین و شرایط معامله، سند را تولید کنید. برای تأمین‌کننده معمولاً Purchase Order / Supplier Order صادر می‌شود؛ فاکتور خرید را خود تأمین‌کننده صادر می‌کند. برای خریدار، قبل از معامله معمولاً Proforma Invoice و پس از تحقق شرایط حمل Commercial Invoice استفاده می‌شود."
-    if st.session_state.language == "FA" else
-    "Generate documents only after commercial details are confirmed. For a supplier, the buyer normally issues a Purchase Order / Supplier Order; the supplier issues its own invoice. For the buyer, use a Proforma Invoice before the transaction and a Commercial Invoice when the transaction/shipment stage requires it."
-)
-
-iv1, iv2 = st.columns(2)
-with iv1:
-    doc_kind = st.selectbox(
-        "نوع سند / Document type",
-        ["Proforma Invoice — Buyer", "Purchase Order — Supplier", "Commercial Invoice — Buyer"],
-        key="doc_kind",
-    )
-    doc_no = st.text_input("شماره سند / Document No.", value=f"MA-{date.today().strftime('%Y%m%d')}-001", key="doc_no")
-    party_name = st.text_input("نام طرف مقابل / Counterparty", key="party_name")
-    party_address = st.text_area("آدرس طرف مقابل / Counterparty address", height=70, key="party_address")
-    supplier_name = st.text_input("نام فروشنده / Supplier or Seller", value="Mehr Ara Business", key="supplier_name")
-    supplier_address = st.text_area("آدرس فروشنده / Seller address", height=70, key="supplier_address")
-with iv2:
-    currency = st.selectbox("ارز / Currency", ["USD", "EUR", "OMR", "AED", "IRR"], index=0, key="doc_currency")
-    doc_qty = st.text_input("مقدار / Quantity", value=(st.session_state.last_trade_case or {}).get("quantity", ""), key="doc_qty")
-    doc_product = st.text_input("کالا / Product", value=(st.session_state.last_trade_case or {}).get("product", ""), key="doc_product")
-    doc_unit = st.number_input("قیمت واحد / Unit price", min_value=0.0, value=float((st.session_state.calc_result or ({"unit_sale": 0.0}, None))[0].get("unit_sale", 0.0) if st.session_state.calc_result and st.session_state.calc_result[0] else 0.0), step=0.01, key="doc_unit")
-    doc_total = st.number_input("مبلغ کل / Total", min_value=0.0, value=float((st.session_state.calc_result or ({"sale_price": 0.0}, None))[0].get("sale_price", 0.0) if st.session_state.calc_result and st.session_state.calc_result[0] else 0.0), step=0.01, key="doc_total")
-    incoterm = st.text_input("اینکوترمز / Incoterm", value="CIF", key="doc_incoterm")
-    payment_terms = st.text_input("شرایط پرداخت / Payment terms", value="LC at Sight", key="doc_payment")
-    validity = st.text_input("اعتبار / Validity", value="7 days", key="doc_validity")
-    doc_notes = st.text_area("توضیحات / Notes", value=(st.session_state.last_trade_case or {}).get("notes", ""), height=80, key="doc_notes")
-
-confirm_details = st.checkbox(
-    "من قیمت، مقدار، ارز، طرفین و شرایط تجاری را بررسی و تأیید کرده‌ام / I confirm the commercial details have been reviewed.",
-    key="confirm_commercial_details",
-)
-
-g1, g2 = st.columns(2)
-with g1:
-    if st.button("📄 تولید PDF / Generate PDF", type="primary", use_container_width=True, disabled=not confirm_details):
-        pdf_bytes = build_invoice_pdf(
-            doc_kind, doc_no, party_name, party_address, supplier_name, supplier_address,
-            doc_product, doc_qty, doc_unit, doc_total, currency, incoterm, payment_terms,
-            validity, doc_notes, st.session_state.language,
-        )
-        st.session_state.invoice_docs = {
-            "bytes": pdf_bytes, "filename": f"{doc_no.replace(' ', '_')}.pdf",
-            "kind": doc_kind, "message": invoice_message(doc_kind, doc_no, doc_product, doc_total, currency, incoterm, payment_terms, st.session_state.language)
-        }
-        st.session_state.invoice_generated = True
-with g2:
-    wa_phone = st.text_input("شماره واتساپ طرف مقابل / WhatsApp number", placeholder="9689XXXXXXXX", key="wa_phone")
-
-if st.session_state.invoice_generated and st.session_state.invoice_docs:
-    d = st.session_state.invoice_docs
-    st.download_button(
-        "⬇️ دانلود PDF / Download PDF",
-        data=d["bytes"],
-        file_name=d["filename"],
-        mime="application/pdf",
-        use_container_width=True,
-    )
-    link = whatsapp_link(wa_phone, d["message"])
-    if link:
-        st.markdown(f"[💬 باز کردن واتساپ با پیام آماده / Open WhatsApp]({link})")
-        st.caption(
-            "نسخه فعلی واتساپ لینک پیام آماده را باز می‌کند؛ فایل PDF را باید در واتساپ پیوست کنید. ارسال خودکار PDF نیازمند WhatsApp Business Cloud API است."
-            if st.session_state.language == "FA" else
-            "The current WhatsApp button opens a pre-filled message; attach the PDF manually. Automatic PDF attachment requires WhatsApp Business Cloud API."
-        )
-    else:
-        st.info("برای ساخت لینک واتساپ، شماره بین‌المللی طرف مقابل را وارد کنید." if st.session_state.language == "FA" else "Enter the counterparty's international WhatsApp number to create the WhatsApp link.")
 
 # ---------------------- live research -------------------------
 st.markdown(f'<div class="section-title">{T["research"]}</div>',unsafe_allow_html=True)
