@@ -640,6 +640,41 @@ if st.session_state.calc_result:
         else:
             st.markdown(calculator_markdown(calc,st.session_state.language))
 
+# ---------------------- currency converter --------------------
+st.markdown('<div class="section-title">Currency Converter / تبدیل ارز</div>', unsafe_allow_html=True)
+st.caption("تومان ایران، ریال ایران، دلار آمریکا و ریال عمان پشتیبانی می‌شوند. نرخ تومان به‌دلیل تفاوت نرخ بازار و نرخ رسمی باید توسط شما تعیین و با تاریخ/منبع ثبت شود؛ نرخ تبدیل به‌صورت خودکار از اینترنت دریافت نمی‌شود." if st.session_state.language=="FA" else "Supports Iranian toman, Iranian rial, US dollar and Omani rial. Iranian toman rates vary by market and must be entered and verified by you; exchange rates are not fetched live.")
+cur_names = {
+    "USD — US Dollar": "USD",
+    "IRT — Iranian Toman": "IRT",
+    "IRR — Iranian Rial": "IRR",
+    "OMR — Omani Rial": "OMR",
+    "EUR — Euro": "EUR",
+}
+c1,c2,c3 = st.columns(3)
+with c1:
+    conv_amount = st.text_input("Amount / مبلغ", value="100", key="conv_amount")
+    conv_from_label = st.selectbox("From / از ارز", list(cur_names.keys()), index=0, key="conv_from")
+with c2:
+    conv_to_label = st.selectbox("To / به ارز", list(cur_names.keys()), index=1, key="conv_to")
+    conv_rate = st.text_input("Exchange rate / نرخ تبدیل", value="", placeholder="مثلاً: 1 USD = چند تومان؟", key="conv_rate")
+with c3:
+    st.markdown("**نحوه ورود نرخ / Rate format**")
+    st.caption("نرخ را به شکل «۱ واحد ارز مبدأ = چند واحد ارز مقصد» وارد کنید. مثال: اگر ۱ دلار = ۶۰۰٬۰۰۰ تومان، عدد 600000 را بنویسید. نرخ بازار را پیش از استفاده تأیید کنید." if st.session_state.language=="FA" else "Enter how many target-currency units equal 1 unit of the source currency. Example: if 1 USD = 600,000 toman, enter 600000. Verify the rate before use.")
+if st.button("تبدیل ارز / Convert", use_container_width=True, key="convert_currency_btn"):
+    amount_value = parse_number(conv_amount)
+    rate_value = parse_number(conv_rate)
+    from_code, to_code = cur_names[conv_from_label], cur_names[conv_to_label]
+    if amount_value is None or amount_value < 0:
+        st.error("مبلغ معتبر وارد کنید. / Enter a valid non-negative amount.")
+    elif from_code == to_code:
+        st.success(f"{amount_value:,.4f} {to_code}")
+    elif rate_value is None or rate_value <= 0:
+        st.error("نرخ تبدیل معتبر وارد کنید؛ سیستم نرخ تومان را حدس نمی‌زند. / Enter a valid exchange rate; the app will not guess the toman rate.")
+    else:
+        converted = amount_value * rate_value
+        st.success(f"{amount_value:,.4f} {from_code} = {converted:,.4f} {to_code}")
+        st.caption("این تبدیل بر اساس نرخ دستی واردشده است و تأیید نرخ بازار محسوب نمی‌شود. / Conversion uses your manually entered rate; it is not a live market quote.")
+
 # ---------------------- live research -------------------------
 st.markdown(f'<div class="section-title">{T["research"]}</div>',unsafe_allow_html=True)
 st.caption(T["research_caption"])
