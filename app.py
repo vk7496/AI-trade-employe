@@ -6,6 +6,10 @@ from typing import Optional, Tuple, List, Dict
 
 import httpx
 import streamlit as st
+from io import BytesIO
+from datetime import date
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
 
 # ============================================================
 # MEHR ARA AI TRADE EMPLOYEE
@@ -166,38 +170,86 @@ class DuckDuckGoParser(HTMLParser):
             self._in_snippet = False
 
 
+class BingParser(HTMLParser):
+    """Extract organic results from Bing HTML search pages."""
+    def __init__(self):
+        super().__init__()
+        self.results = []
+        self._in_result = False
+        self._in_h2 = False
+        self._in_a = False
+        self._current = None
+        self._snippet = False
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        cls = attrs.get("class", "")
+        if tag == "li" and "b_algo" in cls:
+            self._in_result = True
+            self._current = {"title": "", "url": "", "snippet": ""}
+        elif self._in_result and tag == "h2":
+            self._in_h2 = True
+        elif self._in_result and tag == "a" and self._in_h2:
+            self._in_a = True
+            if self._current is not None:
+                self._current["url"] = attrs.get("href", "")
+        elif self._in_result and tag in ("p", "div") and ("b_caption" in cls or "b_snippet" in cls):
+            self._snippet = True
+
+    def handle_data(self, data):
+        if self._current is None:
+            return
+        if self._in_a:
+            self._current["title"] += data
+        elif self._snippet:
+            self._current["snippet"] += data
+
+    def handle_endtag(self, tag):
+        if tag == "a":
+            self._in_a = False
+        elif tag == "h2":
+            self._in_h2 = False
+        elif tag == "li" and self._in_result:
+            if self._current and self._current.get("title") and self._current.get("url", "").startswith("http"):
+                self.results.append(self._current)
+            self._current = None
+            self._in_result = False
+            self._snippet = False
+        elif tag in ("p", "div"):
+            self._snippet = False
+
+
 def live_web_search(query: str, limit: int = 6) -> List[Dict[str, str]]:
-    """Fetch search results independently of model tool-call rendering."""
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; MehrAraTradeResearch/1.0)"}
-    urls = [
-        "https://html.duckduckgo.com/html/?q=" + quote_plus(query),
-        "https://www.google.com/search?q=" + quote_plus(query),
+    """Search independent HTML engines; parse each engine with its own markup parser."""
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/128 Safari/537.36"}
+    search_targets = [
+        ("bing", "https://www.bing.com/search?q=" + quote_plus(query)),
+        ("ddg", "https://html.duckduckgo.com/html/?q=" + quote_plus(query)),
     ]
-    for url in urls:
+    for engine, url in search_targets:
         try:
             with httpx.Client(timeout=httpx.Timeout(18.0, connect=8.0), follow_redirects=True) as client:
                 response = client.get(url, headers=headers)
             if response.status_code >= 400 or not response.text:
                 continue
-            parser = DuckDuckGoParser()
+            parser = BingParser() if engine == "bing" else DuckDuckGoParser()
             parser.feed(response.text)
-            results = []
-            seen = set()
+            results, seen = [], set()
             for item in parser.results:
-                link = item.get("url", "").strip()
+                link = (item.get("url") or "").strip()
                 if link.startswith("//"):
                     link = "https:" + link
-                if not link.startswith("http") or link in seen:
+                if not link.startswith("http"):
                     continue
                 host = urlparse(link).netloc.lower()
-                if "duckduckgo.com" in host or "google.com" in host:
+                if any(bad in host for bad in ("bing.com", "duckduckgo.com", "google.com")) or link in seen:
+                    continue
+                title = re.sub(r"\\s+", " ", item.get("title", "")).strip()
+                snippet = re.sub(r"\\s+", " ", item.get("snippet", "")).strip()
+                if not title:
                     continue
                 seen.add(link)
-                results.append({
-                    "title": re.sub(r"\s+", " ", item.get("title", "")).strip(),
-                    "url": link,
-                    "snippet": re.sub(r"\s+", " ", item.get("snippet", "")).strip(),
-                })
+                results.append({"title": title, "url": link, "snippet": snippet})
                 if len(results) >= limit:
                     break
             if results:
@@ -205,7 +257,6 @@ def live_web_search(query: str, limit: int = 6) -> List[Dict[str, str]]:
         except Exception:
             continue
     return []
-
 
 def format_search_results(results: List[Dict[str, str]]) -> str:
     if not results:
@@ -807,6 +858,70 @@ For every legal or rate claim, cite the source. If the exact rate depends on HS 
 if st.session_state.research_result:
     with st.container(border=True):
         st.markdown(st.session_state.research_result)
+
+# ---------------------- invoice / order document center ----------------------
+st.markdown('<div class="section-title">Invoice & Order Documents / صدور پیش‌فاکتور و سفارش خرید</div>', unsafe_allow_html=True)
+st.caption("پیش‌فاکتور خریدار و سفارش خرید تأمین‌کننده را پس از بررسی اطلاعات تجاری تولید کنید. این اسناد پیش‌نویس‌اند و قبل از ارسال باید تأیید شوند.")
+with st.form("invoice_form"):
+    inv_cols = st.columns(2)
+    with inv_cols[0]:
+        inv_type = st.selectbox("نوع سند", ["Proforma Invoice — Buyer", "Purchase Order — Supplier", "Commercial Invoice — Buyer"])
+        inv_no = st.text_input("شماره سند", value=f"MA-{date.today().strftime('%Y%m%d')}-001")
+        inv_seller = st.text_input("فروشنده / صادرکننده", value="Mehr Ara")
+        inv_buyer = st.text_input("خریدار / تأمین‌کننده طرف مقابل")
+        inv_product = st.text_input("شرح کالا", value=st.session_state.get("last_trade_case", {}).get("product", ""))
+    with inv_cols[1]:
+        inv_qty = st.text_input("مقدار و واحد", value=st.session_state.get("last_trade_case", {}).get("quantity", ""))
+        inv_unit_price = st.text_input("قیمت هر واحد (USD)", value="")
+        inv_incoterm = st.selectbox("Incoterm", ["EXW", "FCA", "FOB", "CFR", "CIF", "DAP", "DDP"], index=4)
+        inv_payment = st.text_input("شرایط پرداخت", value="To be agreed")
+        inv_validity = st.text_input("اعتبار پیش‌فاکتور", value="7 days")
+    inv_address = st.text_input("نشانی طرف مقابل (اختیاری)")
+    inv_confirm = st.checkbox("اطلاعات طرفین، کالا، مقدار، ارز و شرایط تجاری را بررسی کرده‌ام.")
+    inv_submit = st.form_submit_button("ساخت سند PDF", type="primary", use_container_width=True)
+
+if inv_submit:
+    qv = parse_number(inv_qty)
+    uv = parse_number(inv_unit_price)
+    if not inv_confirm:
+        st.error("برای تولید سند، ابتدا تأیید اطلاعات را فعال کنید.")
+    elif not inv_product.strip() or not inv_buyer.strip() or qv is None or uv is None or qv <= 0 or uv < 0:
+        st.error("شرح کالا، نام طرف مقابل، مقدار و قیمت هر واحد معتبر لازم است.")
+    else:
+        total = qv * uv
+        buf = BytesIO()
+        pdf = canvas.Canvas(buf, pagesize=A4)
+        width, height = A4
+        pdf.setTitle(inv_no)
+        pdf.setFont("Helvetica-Bold", 18)
+        pdf.drawString(48, height-55, "MEHR ARA")
+        pdf.setFont("Helvetica-Bold", 14)
+        pdf.drawString(48, height-85, inv_type)
+        pdf.setFont("Helvetica", 10)
+        rows = [
+            ("Document No.", inv_no), ("Date", date.today().isoformat()),
+            ("Seller / Issuer", inv_seller), ("Buyer / Counterparty", inv_buyer),
+            ("Counterparty Address", inv_address or "Not provided"),
+            ("Product", inv_product), ("Quantity", inv_qty),
+            ("Unit Price", f"USD {uv:,.2f}"), ("Total Goods Value", f"USD {total:,.2f}"),
+            ("Incoterm", inv_incoterm), ("Payment Terms", inv_payment),
+            ("Validity", inv_validity),
+        ]
+        y = height - 125
+        for label, value in rows:
+            pdf.setFont("Helvetica-Bold", 10)
+            pdf.drawString(48, y, label + ":")
+            pdf.setFont("Helvetica", 10)
+            pdf.drawString(190, y, str(value)[:95])
+            y -= 25
+            if y < 100:
+                pdf.showPage()
+                y = height - 60
+        pdf.setFont("Helvetica-Oblique", 9)
+        pdf.drawString(48, 55, "DRAFT ONLY — verify specifications, taxes, delivery, payment and legal requirements before issuance.")
+        pdf.save()
+        st.download_button("دانلود PDF سند", data=buf.getvalue(), file_name=f"{inv_no}.pdf", mime="application/pdf", use_container_width=True)
+        st.success(f"پیش‌نویس ساخته شد. ارزش کالا: USD {total:,.2f}. این فایل هنوز تأیید نهایی تجاری/حقوقی نیست.")
 
 # -------------------------- demo case -------------------------
 st.markdown('<div class="section-title">Live Trade Case — Demo</div>',unsafe_allow_html=True)
