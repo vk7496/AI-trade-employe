@@ -265,7 +265,7 @@ def extract_market_price(text: str):
 
 
 def market_price_research(product: str, quantity: str, origin: str, destination: str, language: str) -> str:
-    """Live market-price research. Groq GPT-OSS browser search is used; no hard-coded price is used."""
+    """Research a market benchmark. Never accept raw tool traces or unsourced prices."""
     prompt = f"""You are the live market-pricing researcher for Mehr Ara AI Trade Employee.
 
 Research the CURRENT 2026 wholesale/B2B market price for this trade request:
@@ -299,7 +299,45 @@ MARKET_PRICE_CONFIDENCE: HIGH|MEDIUM|LOW
 
 Also provide a short readable explanation with source names/URLs and the date of each relevant source.
 {clean_farsi_prompt(language)}"""
-    return call_ai(prompt, language, web_search=True)
+    # Do not route this task to OpenRouter/free: it is not guaranteed to have web access.
+    # Only accept a Groq response if it contains the required machine-readable range and source URLs.
+    models = [get_secret("GROQ_MODEL", "openai/gpt-oss-120b"), "openai/gpt-oss-20b"]
+    seen = set()
+    errors = []
+    for model in models:
+        if model in seen:
+            continue
+        seen.add(model)
+        ok, content, detail = provider_call("Groq", model, prompt, language, web_search=True)
+        if not ok:
+            errors.append(detail)
+            continue
+        # Some failed/incompatible tool responses expose internal tool-call traces as plain text.
+        raw_tool_trace = re.search(r"tool_call_start|tool_call_end|browser_search|google_search|\bsearch_query\s*=", content, re.I)
+        if raw_tool_trace:
+            errors.append("Search tool response was not rendered as a normal answer")
+            continue
+        has_source_url = bool(re.search(r"https?://[^\s)\]>]+", content, re.I))
+        has_range_marker = bool(re.search(r"MARKET_PRICE_RANGE_USD_PER_KG\s*:", content, re.I))
+        if not has_source_url:
+            errors.append("No source URLs were returned")
+            continue
+        if not has_range_marker:
+            errors.append("No machine-readable price range was returned")
+            continue
+        st.session_state.last_provider = "Groq"
+        st.session_state.last_model = model
+        st.session_state.last_error = None
+        return content.strip()
+
+    # Fail closed: never let a no-web backup model manufacture a current market price.
+    reason = "؛ ".join(errors[:2]) if errors else "منبع معتبر قیمت پیدا نشد"
+    if language == "FA":
+        return ("**قیمت بازار تأیید نشد.** جست‌وجوی زنده خروجی قابل استناد برنگرداند؛ بنابراین قیمت یا بازه ساختگی نمایش داده نمی‌شود.\n\n"
+                f"وضعیت: {reason}.\n\nبرای ادامه، اتصال جست‌وجوی وب Groq و دسترسی مدل به ابزار جست‌وجو باید بررسی شود. پس از دریافت منبع معتبر، قیمت هر کیلو و ارزش کل محاسبه خواهد شد.\n\n"
+                "MARKET_PRICE_RANGE_USD_PER_KG: UNAVAILABLE")
+    return ("**Market price not verified.** Live search did not return a citable result, so no price range is shown.\n\n"
+            f"Status: {reason}. Check Groq web-search tool access.\n\nMARKET_PRICE_RANGE_USD_PER_KG: UNAVAILABLE")
 
 # ------------------------- deterministic calculator ----------
 def calculate_price(quantity, unit_purchase, inland, freight, insurance, duty_pct, vat_pct, bank_pct, other, margin_pct):
