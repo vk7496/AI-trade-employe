@@ -1,6 +1,8 @@
 import os
 import re
-from typing import Optional, Tuple
+from html.parser import HTMLParser
+from urllib.parse import quote_plus, urlparse
+from typing import Optional, Tuple, List, Dict
 
 import httpx
 import streamlit as st
@@ -123,6 +125,95 @@ def money(x: float, currency: str = "USD") -> str:
 
 def pct(x: float) -> str:
     return f"{x:.2f}%"
+
+
+class DuckDuckGoParser(HTMLParser):
+    """Small standard-library parser for DuckDuckGo HTML search results."""
+    def __init__(self):
+        super().__init__()
+        self.results = []
+        self._current = None
+        self._in_title = False
+        self._in_snippet = False
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        cls = attrs.get("class", "")
+        href = attrs.get("href", "")
+        if tag == "a" and "result__a" in cls:
+            self._current = {"title": "", "url": href, "snippet": ""}
+            self._in_title = True
+            self._in_snippet = False
+        elif self._current is not None and tag in ("a", "div", "span") and "result__snippet" in cls:
+            self._in_snippet = True
+            self._in_title = False
+
+    def handle_data(self, data):
+        if self._current is None:
+            return
+        if self._in_title:
+            self._current["title"] += data
+        elif self._in_snippet:
+            self._current["snippet"] += data
+
+    def handle_endtag(self, tag):
+        if tag == "a" and self._in_title and self._current is not None:
+            self._in_title = False
+            if self._current.get("title") and self._current.get("url"):
+                self.results.append(self._current)
+                self._current = None
+        if tag in ("div", "span"):
+            self._in_snippet = False
+
+
+def live_web_search(query: str, limit: int = 6) -> List[Dict[str, str]]:
+    """Fetch search results independently of model tool-call rendering."""
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; MehrAraTradeResearch/1.0)"}
+    urls = [
+        "https://html.duckduckgo.com/html/?q=" + quote_plus(query),
+        "https://www.google.com/search?q=" + quote_plus(query),
+    ]
+    for url in urls:
+        try:
+            with httpx.Client(timeout=httpx.Timeout(18.0, connect=8.0), follow_redirects=True) as client:
+                response = client.get(url, headers=headers)
+            if response.status_code >= 400 or not response.text:
+                continue
+            parser = DuckDuckGoParser()
+            parser.feed(response.text)
+            results = []
+            seen = set()
+            for item in parser.results:
+                link = item.get("url", "").strip()
+                if link.startswith("//"):
+                    link = "https:" + link
+                if not link.startswith("http") or link in seen:
+                    continue
+                host = urlparse(link).netloc.lower()
+                if "duckduckgo.com" in host or "google.com" in host:
+                    continue
+                seen.add(link)
+                results.append({
+                    "title": re.sub(r"\s+", " ", item.get("title", "")).strip(),
+                    "url": link,
+                    "snippet": re.sub(r"\s+", " ", item.get("snippet", "")).strip(),
+                })
+                if len(results) >= limit:
+                    break
+            if results:
+                return results
+        except Exception:
+            continue
+    return []
+
+
+def format_search_results(results: List[Dict[str, str]]) -> str:
+    if not results:
+        return "NO SEARCH RESULTS RETURNED. Do not invent companies, prices or URLs."
+    return "\n\n".join(
+        f"[{i}] {r['title']}\nURL: {r['url']}\nSnippet: {r.get('snippet') or 'No snippet available'}"
+        for i, r in enumerate(results, 1)
+    )
 
 
 def demo_response(language: str) -> str:
@@ -265,79 +356,59 @@ def extract_market_price(text: str):
 
 
 def market_price_research(product: str, quantity: str, origin: str, destination: str, language: str) -> str:
-    """Research a market benchmark. Never accept raw tool traces or unsourced prices."""
-    prompt = f"""You are the live market-pricing researcher for Mehr Ara AI Trade Employee.
+    """Search the web first, then ask the model to analyze only retrieved sources."""
+    query = f'wholesale B2B price {product} per kg supplier quotation {origin} {destination} 2026'
+    results = live_web_search(query, limit=8)
+    # Broaden once if exact phrasing yields no results.
+    if not results:
+        results = live_web_search(f'{product} exporter wholesale price per kg quotation', limit=8)
+    source_block = format_search_results(results)
+    if not results:
+        return ("**قیمت بازار تأیید نشد.** جست‌وجوی وب در این اجرا نتیجه قابل بازیابی نداد؛ قیمت ساختگی نمایش داده نمی‌شود.\n\n"
+                "اتصال شبکه یا دسترسی موتور جست‌وجو باید بررسی شود.\n\nMARKET_PRICE_RANGE_USD_PER_KG: UNAVAILABLE")
 
-Research the CURRENT 2026 wholesale/B2B market price for this trade request:
-Product: {product or 'Not provided'}
-Quantity: {quantity or 'Not provided'}
-Origin: {origin or 'Not provided'}
-Destination: {destination or 'Not provided'}
+    prompt = f"""You are the commercial market analyst for Mehr Ara AI Trade Employee.
+Analyze ONLY the web search results supplied below. Do not claim to have opened pages if you only have snippets.
+Product: {product or 'not specified'}
+Quantity: {quantity or 'not specified'}
+Origin: {origin or 'not specified'}
+Destination: {destination or 'not specified'}
+Current date: 2026-10-12
 
-Use browser search and prioritize:
-1) recent supplier quotations/listings for the same product and grade;
-2) credible trade-market sources;
-3) official trade statistics such as UN Comtrade/WITS as a historical benchmark, clearly labeled as historical/unit-value data.
+Search results retrieved now:
+{source_block}
 
-Rules:
-- Do NOT invent a price.
-- Do NOT mix retail per-gram prices with wholesale per-kg prices.
-- Do NOT treat an old trade statistic as today's quotation.
-- If the product is saffron, distinguish Super Negin/Negin/Sargol/Pushal and only use the requested grade when it is known. If grade is missing, explicitly say that grade is required and give separate ranges only when sources support them.
-- Prefer at least two independent current/recent sources when available.
-- State Incoterm for every direct quotation (EXW/FOB/CIF/etc.). Never convert EXW/FOB/CIF into another Incoterm unless a documented cost supports the conversion.
-- The result is a MARKET BENCHMARK, not a confirmed supplier quotation.
+Tasks:
+- Identify which sources actually relate to this exact product and B2B/wholesale pricing.
+- Distinguish current supplier asking prices from historical trade statistics, retail listings and irrelevant pages.
+- Do not infer a price from a title alone. Only produce a USD/kg range if snippets or source titles explicitly support price and unit, or a direct quoted listing clearly shows it.
+- Do not convert currencies unless the conversion rate is present in the sources. Do not mix grades, product forms, packaging sizes or Incoterms.
+- If evidence is insufficient, say price unavailable and explain what quotation is needed.
+- Include source title, URL, and the evidence/limitation for every price used.
+- Never invent suppliers, contacts, certifications or prices.
 
-At the end, output EXACTLY one machine-readable line in this format if a defensible wholesale range is available:
+Output exactly one machine-readable line:
 MARKET_PRICE_RANGE_USD_PER_KG: <low>-<high>
-If no defensible USD/kg range is available, output:
+Or if not supported:
 MARKET_PRICE_RANGE_USD_PER_KG: UNAVAILABLE
-
-Then output:
-MARKET_PRICE_BASIS: <one sentence explaining the basis and Incoterm>
-MARKET_PRICE_CONFIDENCE: HIGH|MEDIUM|LOW
-
-Also provide a short readable explanation with source names/URLs and the date of each relevant source.
+Then output MARKET_PRICE_BASIS and MARKET_PRICE_CONFIDENCE (HIGH|MEDIUM|LOW).
 {clean_farsi_prompt(language)}"""
-    # Do not route this task to OpenRouter/free: it is not guaranteed to have web access.
-    # Only accept a Groq response if it contains the required machine-readable range and source URLs.
-    models = [get_secret("GROQ_MODEL", "openai/gpt-oss-120b"), "openai/gpt-oss-20b"]
-    seen = set()
-    errors = []
-    for model in models:
-        if model in seen:
-            continue
-        seen.add(model)
-        ok, content, detail = provider_call("Groq", model, prompt, language, web_search=True)
-        if not ok:
-            errors.append(detail)
-            continue
-        # Some failed/incompatible tool responses expose internal tool-call traces as plain text.
-        raw_tool_trace = re.search(r"tool_call_start|tool_call_end|browser_search|google_search|\bsearch_query\s*=", content, re.I)
-        if raw_tool_trace:
-            errors.append("Search tool response was not rendered as a normal answer")
-            continue
-        has_source_url = bool(re.search(r"https?://[^\s)\]>]+", content, re.I))
-        has_range_marker = bool(re.search(r"MARKET_PRICE_RANGE_USD_PER_KG\s*:", content, re.I))
-        if not has_source_url:
-            errors.append("No source URLs were returned")
-            continue
-        if not has_range_marker:
-            errors.append("No machine-readable price range was returned")
-            continue
-        st.session_state.last_provider = "Groq"
-        st.session_state.last_model = model
-        st.session_state.last_error = None
-        return content.strip()
-
-    # Fail closed: never let a no-web backup model manufacture a current market price.
-    reason = "؛ ".join(errors[:2]) if errors else "منبع معتبر قیمت پیدا نشد"
-    if language == "FA":
-        return ("**قیمت بازار تأیید نشد.** جست‌وجوی زنده خروجی قابل استناد برنگرداند؛ بنابراین قیمت یا بازه ساختگی نمایش داده نمی‌شود.\n\n"
-                f"وضعیت: {reason}.\n\nبرای ادامه، اتصال جست‌وجوی وب Groq و دسترسی مدل به ابزار جست‌وجو باید بررسی شود. پس از دریافت منبع معتبر، قیمت هر کیلو و ارزش کل محاسبه خواهد شد.\n\n"
-                "MARKET_PRICE_RANGE_USD_PER_KG: UNAVAILABLE")
-    return ("**Market price not verified.** Live search did not return a citable result, so no price range is shown.\n\n"
-            f"Status: {reason}. Check Groq web-search tool access.\n\nMARKET_PRICE_RANGE_USD_PER_KG: UNAVAILABLE")
+    analysis = call_ai(prompt, language, web_search=False)
+    # Preserve actual URLs retrieved by our search, even if the model omits them.
+    source_footer = "\n\n### منابع جست‌وجوشده\n" + "\n".join(
+        f"- [{r['title']}]({r['url']}) — {r.get('snippet') or 'خلاصه‌ای از نتیجه جست‌وجو در دسترس نبود.'}"
+        for r in results
+    )
+    if "MARKET_PRICE_RANGE_USD_PER_KG:" not in analysis:
+        analysis += "\n\nMARKET_PRICE_RANGE_USD_PER_KG: UNAVAILABLE"
+    if re.search(r"MARKET_PRICE_RANGE_USD_PER_KG\s*:\s*(?!UNAVAILABLE)[0-9,.$\s.-]+", analysis, re.I):
+        # Require at least one retrieved source whose snippet/title contains a numeric price cue.
+        price_evidence = any(re.search(r"(?:\$|USD|price|kg|/kg|per kg|\d[,.]\d)", r.get("title", "") + " " + r.get("snippet", ""), re.I) for r in results)
+        if not price_evidence:
+            analysis = re.sub(r"MARKET_PRICE_RANGE_USD_PER_KG\s*:\s*.*", "MARKET_PRICE_RANGE_USD_PER_KG: UNAVAILABLE", analysis, flags=re.I)
+            analysis += "\n\nقیمت قابل استخراج از متن نتایج جست‌وجو نبود؛ برای جلوگیری از عددسازی، بازه قیمت تأیید نشد."
+    st.session_state.last_provider = st.session_state.last_provider or "Groq"
+    return analysis.strip() + source_footer
 
 # ------------------------- deterministic calculator ----------
 def calculate_price(quantity, unit_purchase, inland, freight, insurance, duty_pct, vat_pct, bank_pct, other, margin_pct):
@@ -710,7 +781,27 @@ Use browser search and prioritize official government sources such as customs an
 For every legal or rate claim, cite the source. If the exact rate depends on HS code or product attributes, say so and do not guess.
 {clean_farsi_prompt(st.session_state.language)}"""
         with st.spinner(T["research_working"]):
-            research=call_ai(prompt,st.session_state.language,web_search=True)
+            if research_mode in (T["buyer_research"], T["supplier_research"]):
+                role_word = "importer buyer distributor" if research_mode == T["buyer_research"] else "manufacturer exporter wholesaler supplier"
+                query = f'{research_product or "product"} {role_word} {research_market or "Oman"} official website'
+                web_results = live_web_search(query, limit=10)
+                if not web_results:
+                    query = f'{research_product or "product"} {role_word} company contact'
+                    web_results = live_web_search(query, limit=10)
+                if web_results:
+                    prompt += "\n\nREAL WEB SEARCH RESULTS RETRIEVED FOR THIS RUN:\n" + format_search_results(web_results)
+                    prompt += "\nUse only companies evidenced by these results. Keep each supplied URL exactly as retrieved. If results are weak or irrelevant, state that and do not invent alternatives."
+                    research = call_ai(prompt, st.session_state.language, web_search=False)
+                    research += "\n\n### Retrieved source links / منابع بازیابی‌شده\n" + "\n".join(f"- [{r['title']}]({r['url']}) — {r.get('snippet') or 'No snippet available'}" for r in web_results)
+                else:
+                    research = ("**تأمین‌کننده/خریدار قابل استناد پیدا نشد.** موتور جست‌وجو در این اجرا نتیجه‌ای برنگرداند؛ نام یا اطلاعات تماس ساختگی نمایش داده نمی‌شود. لطفاً اتصال شبکه یا عبارت جست‌وجو را بررسی کنید." if st.session_state.language == "FA" else "**No citable buyer/supplier leads found.** The search engine returned no results in this run; no company or contact details have been invented.")
+            else:
+                web_results = live_web_search(f'{research_product or "product"} import customs duty VAT permit {research_market or "Oman"} official', limit=8)
+                if web_results:
+                    prompt += "\n\nREAL WEB SEARCH RESULTS RETRIEVED FOR THIS RUN:\n" + format_search_results(web_results)
+                research = call_ai(prompt, st.session_state.language, web_search=False)
+                if web_results:
+                    research += "\n\n### Official/source links\n" + "\n".join(f"- [{r['title']}]({r['url']}) — {r.get('snippet') or 'No snippet available'}" for r in web_results)
         st.session_state.research_result=research
 
 if st.session_state.research_result:
