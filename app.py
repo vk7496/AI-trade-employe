@@ -1,9 +1,10 @@
-import os
+Import os
 import re
+import base64
 import smtplib
 from email.message import EmailMessage
 from html.parser import HTMLParser
-from urllib.parse import quote_plus, urlparse
+from urllib.parse import quote_plus, urlparse, parse_qs, unquote
 from typing import Optional, Tuple, List, Dict
 
 import httpx
@@ -16,8 +17,8 @@ from reportlab.pdfgen import canvas
 # ============================================================
 # MEHR ARA AI TRADE EMPLOYEE
 # Groq primary -> OpenRouter backup -> Demo fallback
-# Includes deterministic pricing, live web research via Groq,
-# buyer/supplier discovery, customs/compliance, PDF, and Email/WhatsApp dispatch.
+# Live research (Tavily if configured, else Bing/DDG scraping),
+# fixed HS table, anti-fabrication guards, PDF, Email/WhatsApp.
 # ============================================================
 
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
@@ -37,17 +38,18 @@ LANG = {
         "today": "What do you want your digital employee to do today?",
         "sell": "Sell a Product", "source": "Source a Product", "export": "Export a Product",
         "buyers": "Find Buyers", "pricing": "Calculate Price", "operations": "Trade Operations",
-        "assistant": "AI Trade Employee", "active_cases": "Active Cases", "buyer_leads": "Buyer Leads",
-        "suppliers": "Suppliers", "ai_mode": "AI Mode", "demo": "Demo Mode", "ai": "AI",
+        "assistant": "AI Trade Employee", "active_cases": "Cases (this session)", "buyer_leads": "Buyer sources found",
+        "suppliers": "Supplier sources found", "ai_mode": "AI Mode", "demo": "Demo Mode", "ai": "AI",
         "request": "Trade Request", "product": "Product", "quantity": "Quantity", "origin": "Origin",
         "destination": "Destination", "budget": "Budget / Target Price", "notes": "Additional Requirements",
+        "payment": "Payment terms (you decide)",
         "generate": "Generate Trade Plan", "result": "AI Employee Result", "chat": "Ask your AI Trade Employee",
         "message": "Message", "working": "AI Trade Employee is preparing the work...",
         "pricing_title": "Commercial Price Calculator", "calculate": "Calculate Commercial Price",
         "purchase_unit": "Purchase price / unit", "inland": "Inland transport", "freight": "International freight",
         "insurance": "Insurance", "duty": "Customs duty %", "vat": "Import VAT %", "bank": "Bank / LC fee %",
         "other": "Other costs", "margin": "Target margin %", "research": "Live Trade Research",
-        "research_caption": "Uses Groq web search for current companies, buyers, suppliers and official regulatory sources.",
+        "research_caption": "Searches the web for current companies and official sources. Only sources actually retrieved are shown.",
         "research_run": "Research Now", "customs": "Customs & Compliance", "buyer_research": "Find Buyers",
         "supplier_research": "Find Suppliers", "research_working": "Searching current sources...",
         "demo_notice": "Commercial data, prices, duties, taxes, contacts and legal requirements must be verified before a transaction.",
@@ -58,22 +60,47 @@ LANG = {
         "today": "امروز می‌خواهید نیروی دیجیتال شما چه کاری انجام دهد؟",
         "sell": "فروش کالا", "source": "تأمین کالا", "export": "صادرات کالا",
         "buyers": "پیدا کردن خریدار", "pricing": "محاسبه قیمت", "operations": "عملیات بازرگانی",
-        "assistant": "نیروی هوشمند بازرگانی", "active_cases": "پرونده‌های فعال", "buyer_leads": "سرنخ‌های خریدار",
-        "suppliers": "تأمین‌کنندگان", "ai_mode": "حالت هوش مصنوعی", "demo": "حالت نمایشی", "ai": "Groq AI",
+        "assistant": "نیروی هوشمند بازرگانی", "active_cases": "پرونده‌ها (این نشست)", "buyer_leads": "منابع خریدار یافت‌شده",
+        "suppliers": "منابع تأمین‌کننده یافت‌شده", "ai_mode": "حالت هوش مصنوعی", "demo": "حالت نمایشی", "ai": "Groq AI",
         "request": "درخواست بازرگانی", "product": "کالا", "quantity": "مقدار", "origin": "مبدأ",
         "destination": "مقصد", "budget": "بودجه / قیمت هدف", "notes": "نیازمندی‌های بیشتر",
+        "payment": "شرایط پرداخت (خودتان تعیین کنید)",
         "generate": "ساخت برنامه بازرگانی", "result": "خروجی نیروی هوشمند", "chat": "از نیروی هوشمند بازرگانی بپرسید",
         "message": "پیام", "working": "نیروی هوشمند در حال آماده‌سازی نتیجه است...",
         "pricing_title": "محاسبه‌گر قیمت تجاری", "calculate": "محاسبه قیمت",
         "purchase_unit": "قیمت خرید هر واحد", "inland": "حمل داخلی", "freight": "حمل بین‌المللی",
         "insurance": "بیمه", "duty": "حقوق و عوارض گمرکی %", "vat": "مالیات واردات / VAT %", "bank": "کارمزد بانک / LC %",
         "other": "سایر هزینه‌ها", "margin": "حاشیه سود هدف %", "research": "تحقیق زنده بازرگانی",
-        "research_caption": "برای یافتن شرکت‌ها، خریداران، تأمین‌کنندگان و منابع رسمی مقرراتی از جستجوی وب استفاده می‌شود.",
+        "research_caption": "برای یافتن شرکت‌ها و منابع رسمی در وب جستجو می‌شود. فقط منابعی که واقعاً بازیابی شده‌اند نمایش داده می‌شوند.",
         "research_run": "شروع تحقیق", "customs": "گمرک و انطباق", "buyer_research": "پیدا کردن خریدار",
         "supplier_research": "پیدا کردن تأمین‌کننده", "research_working": "در حال جستجوی منابع به‌روز...",
         "demo_notice": "قیمت، هزینه حمل، تعرفه، مالیات، اطلاعات تماس و الزامات قانونی باید پیش از معامله تأیید شوند.",
     },
 }
+
+# ------------------------------------------------------------
+# Fixed HS reference table (CANDIDATE codes — official classification
+# is still required). The model is only allowed to use these.
+# Extend this list with your own products.
+# ------------------------------------------------------------
+HS_TABLE = [
+    (("زعفران", "saffron"), "0910.20", "Saffron"),
+    (("کیوی", "kiwi"), "0810.50", "Kiwifruit"),
+    (("پسته", "pistachio"), "0802.51 (in shell) / 0802.52 (shelled)", "Pistachios"),
+    (("خرما", "dates"), "0804.10", "Dates"),
+    (("کشمش", "raisin", "raisins"), "0806.20", "Raisins"),
+    (("تلیسه", "گوساله", "گاو", "holstein", "heifer", "calf", "calves", "cattle"),
+     "0102.21 (pure-bred breeding) / 0102.29 (other)", "Live bovine animals"),
+]
+HS_RE = re.compile(r"\b\d{4}\.\d{2}(?:\.\d{2})?\b")
+
+EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
+URL_RE = re.compile(r"https?://[^\s)\]>\"'|]+")
+PHONE_RES = [
+    re.compile(r"(?<![\w+])(?:\+|00)\d[\d\s\-()]{6,}\d"),
+    re.compile(r"(?<!\d)09\d{9}(?!\d)"),
+    re.compile(r"(?<!\d)0\d{2,3}[\s\-]\d{7,8}(?!\d)"),
+]
 
 # ----------------------------- state --------------------------
 for key, default in {
@@ -84,9 +111,24 @@ for key, default in {
     "last_error": None,
     "last_provider": None,
     "last_model": None,
+    "fallback_note": None,
+    "search_engine": None,
     "research_result": None,
     "calc_result": None,
     "market_price_result": None,
+    "counters": {"cases": 0, "buyers": 0, "suppliers": 0},
+    "calc_qty": "",
+    "calc_unit": "",
+    "calc_inland": "0",
+    "calc_freight": "0",
+    "calc_ins": "0",
+    "calc_duty": "0",
+    "calc_vat": "0",
+    "calc_bank": "0",
+    "calc_other": "0",
+    "calc_margin": "10",
+    "research_product": "",
+    "research_market": "Oman",
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
@@ -132,6 +174,114 @@ def pct(x: float) -> str:
     return f"{x:.2f}%"
 
 
+def pdf_safe(value: str) -> bool:
+    """Helvetica in the PDF can only render Latin-1 text."""
+    return all(ord(c) < 256 for c in (value or ""))
+
+
+# ---------------- output cleaning / anti-fabrication guards ----------------
+def clean_output(text: str) -> str:
+    """Remove raw HTML (e.g. <br>) that Streamlit would show literally."""
+    text = re.sub(r"<br\s*/?>", " / ", text or "", flags=re.I)
+    text = re.sub(
+        r"</?(?:p|div|span|b|i|u|strong|em|ul|ol|li|table|thead|tbody|tr|td|th|center|font|small|sup|sub)\b[^>]*>",
+        "", text, flags=re.I,
+    )
+    return text
+
+
+def scrub_unverified(text: str, allowed_text: str = "", allowed_urls: Optional[List[str]] = None,
+                     scrub_links: bool = False) -> str:
+    """Replace emails / phones / placeholder strings that do not appear in the
+    allowed source text. Optionally also replace links whose host is not in allowed_urls."""
+    allowed_lower = (allowed_text or "").lower()
+    allowed_digits = re.sub(r"\D", "", normalize_digits(allowed_text or ""))
+
+    def fix_email(m):
+        return m.group(0) if m.group(0).lower() in allowed_lower else "[unverified]"
+
+    def fix_phone(m):
+        digits = re.sub(r"\D", "", normalize_digits(m.group(0)))
+        return m.group(0) if digits and digits in allowed_digits else "[unverified]"
+
+    text = EMAIL_RE.sub(fix_email, text or "")
+    for rx in PHONE_RES:
+        text = rx.sub(fix_phone, text)
+    text = re.sub(r"(?i)\b(?:x{4,}|example\.(?:com|ir|org|net))\b", "[unverified]", text)
+
+    if scrub_links:
+        hosts = {urlparse(u).netloc.lower().removeprefix("www.") for u in (allowed_urls or [])}
+
+        def fix_url(m):
+            raw = m.group(0)
+            url = raw.rstrip(".,;:!?")
+            host = urlparse(url).netloc.lower().removeprefix("www.")
+            return raw if host in hosts else "[unverified link]" + raw[len(url):]
+
+        text = URL_RE.sub(fix_url, text)
+    return text
+
+
+def lookup_hs(product: str) -> Optional[Dict[str, str]]:
+    p = (product or "").lower()
+    for keys, code, name in HS_TABLE:
+        for k in keys:
+            if re.search(rf"(?<![a-z]){re.escape(k.lower())}(?![a-z])", p):
+                return {"code": code, "name": name}
+    return None
+
+
+def hs_instruction(product: str) -> str:
+    hit = lookup_hs(product)
+    if hit:
+        return (f"HS_REFERENCE (internal table, candidate — official classification required): "
+                f"{hit['name']} = {hit['code']}. Use ONLY this code and do not state any other HS code.")
+    return ("HS_REFERENCE: product is not in the internal table. Do NOT guess an HS code; "
+            "write 'HS Code: official classification required'.")
+
+
+def hs_guard(text: str, product: str, language: str) -> str:
+    found = {c[:7] for c in HS_RE.findall(normalize_digits(text or ""))}
+    if not found:
+        return text
+    hit = lookup_hs(product)
+    allowed = {c[:7] for c in HS_RE.findall(hit["code"])} if hit else set()
+    bad = sorted(found - allowed)
+    if not bad:
+        return text
+    if language == "FA":
+        note = (f"\n\n> ⚠️ **هشدار کد HS:** کد(های) {', '.join(bad)} در جدول داخلی تأیید نشده‌اند و ممکن است اشتباه باشند. "
+                "طبقه‌بندی رسمی را از گمرک/تعرفه رسمی بگیرید.")
+    else:
+        note = (f"\n\n> ⚠️ **HS code warning:** code(s) {', '.join(bad)} are not confirmed by the internal table "
+                "and may be wrong. Get the official classification from customs / the official tariff.")
+    return text + note
+
+
+def strip_machine_line(text: str) -> str:
+    return re.sub(r"MARKET_PRICE_RANGE_USD_PER_KG:.*\n?", "", text or "").strip()
+
+
+def numbers_in(text: str) -> List[float]:
+    vals = []
+    for m in re.finditer(r"\d[\d,]*(?:\.\d+)?", normalize_digits(text or "")):
+        try:
+            vals.append(float(m.group(0).replace(",", "")))
+        except ValueError:
+            pass
+    return vals
+
+
+def price_supported(low: float, high: float, source_text: str) -> bool:
+    nums = numbers_in(source_text)
+
+    def has(x: float) -> bool:
+        return any(abs(n - x) <= max(0.01, x * 0.005) for n in nums)
+
+    return has(low) and has(high)
+
+
+# ---------------- web search ----------------
 class DuckDuckGoParser(HTMLParser):
     def __init__(self):
         super().__init__()
@@ -209,7 +359,7 @@ class BingParser(HTMLParser):
         elif tag == "h2":
             self._in_h2 = False
         elif tag == "li" and self._in_result:
-            if self._current and self._current.get("title") and self._current.get("url", "").startswith("http"):
+            if self._current and self._current.get("title") and self._current.get("url"):
                 self.results.append(self._current)
             self._current = None
             self._in_result = False
@@ -218,7 +368,55 @@ class BingParser(HTMLParser):
             self._snippet = False
 
 
+def unwrap_redirect(link: str) -> str:
+    """DuckDuckGo / Bing return redirect links; decode them to the real URL."""
+    try:
+        p = urlparse(link)
+        qs = parse_qs(p.query)
+        if "duckduckgo.com" in p.netloc and "uddg" in qs:
+            return unquote(qs["uddg"][0])
+        if "bing.com" in p.netloc and p.path.startswith("/ck/") and "u" in qs:
+            u = qs["u"][0]
+            if u.startswith("a1"):
+                b = u[2:]
+                b += "=" * (-len(b) % 4)
+                return base64.urlsafe_b64decode(b).decode("utf-8", "ignore")
+    except Exception:
+        pass
+    return link
+
+
+def tavily_search(query: str, limit: int = 8) -> List[Dict[str, str]]:
+    key = (get_secret("TAVILY_API_KEY") or "").strip()
+    if not key:
+        return []
+    try:
+        with httpx.Client(timeout=httpx.Timeout(20.0, connect=8.0)) as client:
+            r = client.post(
+                "https://api.tavily.com/search",
+                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                json={"query": query, "max_results": limit, "search_depth": "basic"},
+            )
+        if r.status_code >= 400:
+            return []
+        out = []
+        for item in r.json().get("results", []):
+            url = (item.get("url") or "").strip()
+            title = re.sub(r"\s+", " ", item.get("title") or "").strip()
+            if url.startswith("http") and title:
+                snippet = re.sub(r"\s+", " ", item.get("content") or "").strip()[:400]
+                out.append({"title": title, "url": url, "snippet": snippet})
+        return out[:limit]
+    except Exception:
+        return []
+
+
 def live_web_search(query: str, limit: int = 6) -> List[Dict[str, str]]:
+    results = tavily_search(query, limit)
+    if results:
+        st.session_state.search_engine = "Tavily"
+        return results
+
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/128 Safari/537.36"}
     search_targets = [
         ("bing", "https://www.bing.com/search?q=" + quote_plus(query)),
@@ -237,6 +435,7 @@ def live_web_search(query: str, limit: int = 6) -> List[Dict[str, str]]:
                 link = (item.get("url") or "").strip()
                 if link.startswith("//"):
                     link = "https:" + link
+                link = unwrap_redirect(link)
                 if not link.startswith("http"):
                     continue
                 host = urlparse(link).netloc.lower()
@@ -251,10 +450,24 @@ def live_web_search(query: str, limit: int = 6) -> List[Dict[str, str]]:
                 if len(results) >= limit:
                     break
             if results:
+                st.session_state.search_engine = "Bing" if engine == "bing" else "DuckDuckGo"
                 return results
         except Exception:
             continue
+    st.session_state.search_engine = None
     return []
+
+
+def multi_search(queries: List[str], limit: int = 10) -> List[Dict[str, str]]:
+    merged, seen = [], set()
+    for q in queries:
+        for r in live_web_search(q, limit=limit):
+            if r["url"] not in seen:
+                seen.add(r["url"])
+                merged.append(r)
+        if len(merged) >= limit:
+            break
+    return merged[:limit]
 
 
 def format_search_results(results: List[Dict[str, str]]) -> str:
@@ -266,6 +479,22 @@ def format_search_results(results: List[Dict[str, str]]) -> str:
     )
 
 
+def sources_table(results: List[Dict[str, str]], language: str) -> str:
+    def esc(s: str, n: int = 160) -> str:
+        return (s or "").replace("|", "/").replace("\n", " ")[:n]
+
+    if language == "FA":
+        head = "| # | عنوان | دامنه | لینک | خلاصه منبع |\n|---|---|---|---|---|\n"
+    else:
+        head = "| # | Title | Domain | Link | Source snippet |\n|---|---|---|---|---|\n"
+    rows = []
+    for i, r in enumerate(results, 1):
+        host = urlparse(r["url"]).netloc.removeprefix("www.")
+        rows.append(f"| {i} | {esc(r['title'], 90)} | {host} | [open]({r['url']}) | {esc(r.get('snippet', ''))} |")
+    return head + "\n".join(rows)
+
+
+# ---------------- AI ----------------
 def demo_response(language: str) -> str:
     if language == "FA":
         return """### گزارش نمایشی
@@ -280,8 +509,10 @@ This is a clearly labeled demo response. Live prices, duties, taxes, freight, co
 
 def clean_farsi_prompt(language: str) -> str:
     if language == "FA":
-        return """پاسخ را کاملاً به فارسی طبیعی و حرفه‌ای بنویس. از فارسی استاندارد استفاده کن. اصطلاحات استاندارد تجارت بین‌الملل مانند USD, kg, MT, FOB, CIF, CFR, EXW, LC, RFQ و HS Code را در لاتین نگه دار. جدول‌ها را خوانا و منظم بنویس."""
-    return "Write clear professional English with consistent terminology and readable Markdown tables."
+        return """پاسخ را کاملاً به فارسی طبیعی و حرفه‌ای بنویس. از فارسی استاندارد استفاده کن. اصطلاحات استاندارد تجارت بین‌الملل مانند USD, kg, MT, FOB, CIF, CFR, EXW, LC, RFQ و HS Code را در لاتین نگه دار.
+فقط Markdown ساده بنویس: هرگز تگ HTML (مثل <br>) ننویس. عنوان‌ها را با ## و بدون شماره‌گذاری (بدون «1.» یا «۲.») بنویس. جدول‌ها را کوتاه، خوانا و با سلول‌های تک‌خطی بنویس."""
+    return ("Write clear professional English with consistent terminology and readable Markdown tables. "
+            "Plain Markdown only: never use HTML tags such as <br>. Use ## headings WITHOUT numbering. Keep table cells single-line.")
 
 
 def provider_call(provider: str, model: str, prompt: str, language: str, history=None, web_search=False) -> Tuple[bool, str, str]:
@@ -293,16 +524,18 @@ def provider_call(provider: str, model: str, prompt: str, language: str, history
     messages = [{
         "role": "system",
         "content": f"""You are Mehr Ara AI Trade Employee, a practical B2B trade operations analyst.
+Today's date: {date.today().isoformat()}.
 
 {clean_farsi_prompt(language)}
 
 Reliability and compliance rules:
-- Never invent a real company, person, phone, WhatsApp, email, quotation, stock level, market price, freight rate, tariff, tax, permit, certificate, legal requirement or customs procedure.
+- Never invent a real company, person, phone, WhatsApp, email, website, quotation, stock level, market price, freight rate, tariff, tax, permit, certificate, legal requirement or customs procedure.
+- Name a company, website, email or phone ONLY if it appears verbatim in sources supplied to you in this conversation. Never output placeholders such as example.com, xxx or info@company.
+- Never assume the payment method, Incoterm, price, currency or quantity unit. Use only what the user provided; if something is missing, list it under 'must be specified by the user' instead of choosing a default (do not default to LC).
 - Clearly distinguish: 1) User-provided facts, 2) Estimate/assumption, 3) Must verify.
-- For any current buyer/supplier/company research, use web search when enabled and provide the source URL/title for each important result.
 - For customs/legal questions, prefer official government/customs/tax sources. Do not present a legal requirement as confirmed unless an authoritative source supports it.
 - For pricing, show arithmetic, units and formulas.
-- For HS Code, give a candidate only when the product description supports it, and label it 'candidate HS Code — official classification required'.
+- For HS Code, use ONLY the HS_REFERENCE given in the prompt. If none is given, write 'HS Code: official classification required'. Always label it 'candidate — official classification required'.
 """}]
     if history:
         messages.extend(history[-8:])
@@ -312,9 +545,9 @@ Reliability and compliance rules:
         "model": model,
         "messages": messages,
         "temperature": 0.1,
-        "max_tokens": 3200,
+        "max_tokens": 4000,
     }
-    if provider == "Groq" and web_search:
+    if provider == "Groq" and web_search and "gpt-oss" in model:
         payload["tools"] = [{"type": "browser_search"}]
         payload["tool_choice"] = "auto"
 
@@ -362,7 +595,8 @@ def call_ai(prompt: str, language: str, history=None, web_search=False) -> str:
             st.session_state.last_provider = "Groq"
             st.session_state.last_model = model
             st.session_state.last_error = None
-            return content
+            st.session_state.fallback_note = " | ".join(errors) if errors else None
+            return clean_output(content)
         errors.append(f"Groq / {model}: {detail}")
 
     or_model = get_secret("OPENROUTER_MODEL", "openrouter/free")
@@ -371,12 +605,14 @@ def call_ai(prompt: str, language: str, history=None, web_search=False) -> str:
         st.session_state.last_provider = "OpenRouter"
         st.session_state.last_model = or_model
         st.session_state.last_error = None
-        return content
+        st.session_state.fallback_note = " | ".join(errors) if errors else None
+        return clean_output(content)
     errors.append(f"OpenRouter / {or_model}: {detail}")
 
     st.session_state.last_provider = "Demo"
     st.session_state.last_model = None
     st.session_state.last_error = " | ".join(errors)
+    st.session_state.fallback_note = None
     return demo_response(language)
 
 
@@ -397,39 +633,102 @@ def extract_market_price(text: str):
 
 
 def market_price_research(product: str, quantity: str, origin: str, destination: str, language: str) -> str:
-    query = f'wholesale B2B price {product} per kg supplier quotation {origin} {destination} 2026'
-    results = live_web_search(query, limit=8)
-    if not results:
-        results = live_web_search(f'{product} exporter wholesale price per kg quotation', limit=8)
+    year = date.today().year
+    results = multi_search([
+        f"wholesale B2B price {product} per kg supplier quotation {origin} {destination} {year}",
+        f"{product} exporter wholesale price per kg quotation {year}",
+    ], limit=8)
     source_block = format_search_results(results)
     if not results:
-        return ("**قیمت بازار تأیید نشد.** جست‌وجوی وب در این اجرا نتیجه قابل بازیابی نداد.\n\nMARKET_PRICE_RANGE_USD_PER_KG: UNAVAILABLE")
+        msg = ("**قیمت بازار تأیید نشد.** جست‌وجوی وب در این اجرا نتیجه قابل بازیابی نداد؛ هیچ قیمتی حدس زده نشد."
+               if language == "FA" else
+               "**Market price not verified.** Web search returned nothing; no price was guessed.")
+        return msg + "\n\nMARKET_PRICE_RANGE_USD_PER_KG: UNAVAILABLE"
 
     prompt = f"""You are the commercial market analyst for Mehr Ara AI Trade Employee.
-Analyze ONLY the web search results supplied below.
+Analyze ONLY the web search results supplied below. Do not use outside knowledge for prices.
 Product: {product or 'not specified'}
 Quantity: {quantity or 'not specified'}
 Origin: {origin or 'not specified'}
 Destination: {destination or 'not specified'}
-Current date: 2026-10-12
+Current date: {date.today().isoformat()}
 
 Search results retrieved now:
 {source_block}
 
-Output exactly one machine-readable line:
+Write a short benchmark summary (which source says what price, in which unit/currency, any conversion you made).
+Then output exactly one machine-readable line, using only numbers that appear in the sources above:
 MARKET_PRICE_RANGE_USD_PER_KG: <low>-<high>
-Or if not supported:
+Or if the sources do not clearly support a USD/kg range:
 MARKET_PRICE_RANGE_USD_PER_KG: UNAVAILABLE
 {clean_farsi_prompt(language)}"""
     analysis = call_ai(prompt, language, web_search=False)
-    source_footer = "\n\n### منابع جست‌وجوشده\n" + "\n".join(
-        f"- [{r['title']}]({r['url']}) — {r.get('snippet') or ''}"
-        for r in results
-    )
+    analysis = scrub_unverified(analysis, source_block, [r["url"] for r in results], scrub_links=True)
+
+    data = extract_market_price(analysis)
+    if data and not price_supported(data["low"], data["high"], source_block):
+        analysis = re.sub(r"MARKET_PRICE_RANGE_USD_PER_KG\s*:.*", "MARKET_PRICE_RANGE_USD_PER_KG: UNAVAILABLE", analysis)
+        analysis += ("\n\n> ⚠️ بازه قیمت مدل در منابع بازیابی‌شده قابل ردیابی نبود و حذف شد."
+                     if language == "FA" else
+                     "\n\n> ⚠️ The model's price range could not be traced to the retrieved sources and was removed.")
     if "MARKET_PRICE_RANGE_USD_PER_KG:" not in analysis:
         analysis += "\n\nMARKET_PRICE_RANGE_USD_PER_KG: UNAVAILABLE"
-    st.session_state.last_provider = st.session_state.last_provider or "Groq"
-    return analysis.strip() + source_footer
+
+    heading = "### منابع جست‌وجوشده" if language == "FA" else "### Sources searched"
+    return analysis.strip() + f"\n\n{heading}\n" + sources_table(results, language)
+
+
+def run_live_research(mode: str, product: str, market: str, language: str, ai_ready: bool):
+    """Returns (markdown, number_of_sources). Never fabricates: if search returns nothing, says so."""
+    product = (product or "").strip()
+    market = (market or "").strip() or "Oman"
+    if mode == "buyers":
+        queries = [f"{product} importer distributor buyer {market}", f"{product} wholesale import company {market}"]
+    elif mode == "suppliers":
+        queries = [f"{product} exporter producer supplier {market}", f"{product} manufacturer wholesale {market}"]
+    else:
+        queries = [f"{market} customs import requirements {product}", f"{market} import permit {product} ministry official"]
+
+    results = multi_search(queries, limit=10)
+    if not results:
+        msg = ("جست‌وجوی وب در این اجرا هیچ نتیجه‌ای بازیابی نکرد، بنابراین **هیچ شرکت یا اطلاعات تماسی نمایش داده نمی‌شود** (چیزی ساخته نشد). "
+               "برای نتیجه پایدارتر، `TAVILY_API_KEY` را در Secrets اضافه کنید."
+               if language == "FA" else
+               "Web search returned nothing, so **no companies or contacts are shown** (nothing was invented). "
+               "For more reliable results add `TAVILY_API_KEY` to Secrets.")
+        return msg, 0
+
+    source_block = format_search_results(results)
+    engine = st.session_state.get("search_engine") or "web"
+    heading = "### منابع بازیابی‌شده" if language == "FA" else "### Retrieved sources"
+    table = f"{heading} ({engine})\n" + sources_table(results, language)
+    if not ai_ready:
+        return table, len(results)
+
+    if mode in ("buyers", "suppliers"):
+        task = ("Return a markdown table: Organization | Type | What the source says | Source # | Confidence (High/Medium/Low). "
+                "List ONLY organizations that are named in the sources. If a source is only an article, directory or marketplace, say so. "
+                "Do NOT output emails, phone numbers or addresses unless they appear verbatim in a snippet. "
+                "End with short 'next verification steps'.")
+    else:
+        task = ("Summarize import/customs requirements ONLY where a snippet explicitly supports them, citing Source #. "
+                "List everything else as 'must verify with the official customs authority'. "
+                "Do not state duty or tax rates unless a snippet gives them.")
+    prompt = f"""Mode: {mode}
+Product: {product}
+Market: {market}
+Today: {date.today().isoformat()}
+{hs_instruction(product)}
+
+SOURCES (the ONLY information you may use):
+{source_block}
+
+Task: {task}
+{clean_farsi_prompt(language)}"""
+    analysis = call_ai(prompt, language, web_search=False)
+    analysis = scrub_unverified(analysis, source_block, [r["url"] for r in results], scrub_links=True)
+    analysis = hs_guard(analysis, product, language)
+    return analysis.strip() + "\n\n" + table, len(results)
 
 
 def calculate_price(quantity, unit_purchase, inland, freight, insurance, duty_pct, vat_pct, bank_pct, other, margin_pct):
@@ -504,8 +803,9 @@ def calculator_markdown(c, language):
 
 
 # ----------------------------- CSS ----------------------------
-st.markdown("""
+BASE_CSS = """
 <style>
+@import url('https://cdn.jsdelivr.net/gh/rastikerdar/vazirmatn@v33.003/Vazirmatn-font-face.css');
 .block-container{padding-top:1.2rem;padding-bottom:3rem;max-width:1450px}
 .hero{padding:30px 34px;border-radius:22px;background:linear-gradient(135deg,#101827,#1b2b43);border:1px solid #293b55;margin-bottom:22px}
 .hero-title{font-size:clamp(25px,4vw,38px);font-weight:800;color:#f5f8fc;margin-bottom:8px}
@@ -517,10 +817,38 @@ st.markdown("""
 .section-title{font-size:23px;font-weight:750;margin-top:30px;margin-bottom:13px}
 .warning-box{padding:13px 16px;border-radius:10px;background:#fff8e5;border:1px solid #f2d58a;color:#684f10}
 .small-muted{color:#78869a;font-size:12px}
+/* tables: scroll horizontally instead of being cut off on mobile */
+[data-testid="stMarkdownContainer"] table{display:block;max-width:100%;overflow-x:auto;border-collapse:collapse}
+[data-testid="stMarkdownContainer"] th,[data-testid="stMarkdownContainer"] td{vertical-align:top;padding:6px 10px;word-break:break-word}
 </style>
-""", unsafe_allow_html=True)
+"""
+
+RTL_CSS = """
+<style>
+html, body, [data-testid="stMarkdownContainer"], .hero, .metric-card, .action-card, .section-title, label, input, textarea {
+    font-family: 'Vazirmatn', 'Segoe UI', sans-serif !important;
+}
+[data-testid="stMarkdownContainer"], .hero, .metric-card, .action-card, .section-title, .warning-box {
+    direction: rtl; text-align: right;
+}
+[data-testid="stMarkdownContainer"] p, [data-testid="stMarkdownContainer"] li,
+[data-testid="stMarkdownContainer"] h1, [data-testid="stMarkdownContainer"] h2,
+[data-testid="stMarkdownContainer"] h3, [data-testid="stMarkdownContainer"] h4,
+[data-testid="stMarkdownContainer"] td, [data-testid="stMarkdownContainer"] th {
+    unicode-bidi: plaintext;
+}
+</style>
+"""
+
+st.markdown(BASE_CSS, unsafe_allow_html=True)
+if st.session_state.language == "FA":
+    st.markdown(RTL_CSS, unsafe_allow_html=True)
 
 # ----------------------------- sidebar ------------------------
+groq_ready = has_key("GROQ_API_KEY")
+or_ready = has_key("OPENROUTER_API_KEY")
+ai_ready = groq_ready or or_ready
+
 with st.sidebar:
     st.markdown("## 🤖 Mehr Ara")
     language = st.selectbox("Language / زبان", ["FA", "EN"], index=0 if st.session_state.language == "FA" else 1)
@@ -530,10 +858,9 @@ with st.sidebar:
     T = LANG[st.session_state.language]
     st.divider()
     st.markdown("### AI Configuration")
-    groq_ready = has_key("GROQ_API_KEY")
-    or_ready = has_key("OPENROUTER_API_KEY")
     st.success("✓ Groq API Ready" if groq_ready else "⚠ Groq API not configured")
     st.success("✓ OpenRouter API Ready" if or_ready else "○ OpenRouter backup not configured")
+    st.success("✓ Tavily search Ready" if has_key("TAVILY_API_KEY") else "○ Tavily not configured (using basic scraping)")
     st.divider()
     st.markdown("### Trade Employee\n\n• Sell & Source\n\n• Export Planning\n\n• Customs Check\n\n• Buyer/Supplier Search\n\n• PDF & Email/WhatsApp")
 
@@ -544,7 +871,13 @@ st.markdown(f'<div class="hero"><div class="badge">AI-POWERED COMMERCIAL OPERATI
 
 m1, m2, m3, m4 = st.columns(4)
 mode = st.session_state.last_provider or ("Groq" if groq_ready else "OpenRouter" if or_ready else "Demo")
-for col, label, value in [(m1, T["active_cases"], "12"), (m2, T["buyer_leads"], "47"), (m3, T["suppliers"], "31"), (m4, T["ai_mode"], mode)]:
+cnt = st.session_state.counters
+for col, label, value in [
+    (m1, T["active_cases"], str(cnt["cases"])),
+    (m2, T["buyer_leads"], str(cnt["buyers"])),
+    (m3, T["suppliers"], str(cnt["suppliers"])),
+    (m4, T["ai_mode"], mode),
+]:
     with col:
         st.markdown(f'<div class="metric-card"><div class="metric-label">{label}</div><div class="metric-value">{value}</div></div>', unsafe_allow_html=True)
 
@@ -576,23 +909,22 @@ with c1:
 with c2:
     destination = st.text_input(T["destination"], placeholder="مثال: Muscat, Oman")
     budget = st.text_input(T["budget"], placeholder="مثال: USD 2,000")
-    notes = st.text_area(T["notes"], placeholder="پرداخت، زمان تحویل، کیفیت، بسته‌بندی...", height=115)
+    payment = st.text_input(T["payment"], placeholder="خالی بگذارید تا به‌عنوان «باید مشخص شود» ثبت شود")
+    notes = st.text_area(T["notes"], placeholder="زمان تحویل، کیفیت، بسته‌بندی...", height=100)
 
 if st.button(T["generate"], type="primary", use_container_width=True):
+    st.session_state.market_price_result = None
     market_text = ""
     market_data = None
-    if product and quantity and groq_ready:
+    if product and quantity and ai_ready:
         with st.spinner("در حال جستجوی قیمت فعلی بازار..." if st.session_state.language == "FA" else "Researching market price..."):
             market_text = market_price_research(product, quantity, origin, destination, st.session_state.language)
         market_data = extract_market_price(market_text)
         st.session_state.market_price_result = {"text": market_text, "data": market_data, "product": product, "quantity": quantity, "destination": destination}
-        if market_data:
-            if not str(st.session_state.get("calc_unit", "")).strip():
-                st.session_state["calc_unit"] = f"{market_data['mid']:.2f} USD/kg"
-            if not str(st.session_state.get("calc_qty", "")).strip():
-                parsed_q = parse_number(quantity)
-                if parsed_q:
-                    st.session_state["calc_qty"] = str(parsed_q)
+        if not str(st.session_state.get("calc_qty", "")).strip():
+            parsed_q = parse_number(quantity)
+            if parsed_q:
+                st.session_state["calc_qty"] = str(parsed_q)
 
     prompt = f"""Trade case for Mehr Ara:
 Workflow: {st.session_state.selected_action}
@@ -601,24 +933,30 @@ Quantity: {quantity or 'Not provided'}
 Origin: {origin or 'Not provided'}
 Destination: {destination or 'Not provided'}
 Budget / target: {budget or 'Not provided'}
+Payment terms: {payment or 'NOT PROVIDED — must be specified by the user; do not assume LC or any other method'}
 Additional requirements: {notes or 'Not provided'}
+
+{hs_instruction(product)}
 
 LIVE MARKET PRICE RESEARCH:
 {market_text or 'No live market price research available.'}
 
 {clean_farsi_prompt(st.session_state.language)}
 
-Create an operational report with:
-1. Executive summary / خلاصه مدیریتی
-2. Known facts vs assumptions table
-3. Current market price benchmark & Incoterm
-4. Buyer/supplier strategy
-5. Customs, HS Code and import-compliance checklist for destination
-6. 5-7 day action plan
-7. Draft RFQ/commercial message
+Create an operational report with these sections (## headings, no numbers):
+- Executive summary
+- Known facts vs assumptions (table; mark every missing input as 'must be specified by the user')
+- Market price benchmark (only from the research above) and Incoterm discussion
+- Buyer/supplier strategy: describe TYPES of buyers/suppliers and channels only. Do NOT name specific companies, emails or phones here — named leads come only from the Live Trade Research section.
+- Customs, HS Code (use HS_REFERENCE only) and import-compliance checklist for the destination, marking each item as verified-by-source or must-verify
+- 5-7 day action plan
+- Draft RFQ/commercial message
 """
     with st.spinner(T["working"]):
         result = call_ai(prompt, st.session_state.language, web_search=bool(groq_ready))
+    allowed = " ".join([market_text, product, quantity, origin, destination, budget, payment, notes])
+    result = scrub_unverified(result, allowed, scrub_links=False)
+    result = hs_guard(result, product, st.session_state.language)
     st.session_state.last_trade_case = {
         "action": st.session_state.selected_action,
         "product": product,
@@ -626,9 +964,11 @@ Create an operational report with:
         "origin": origin,
         "destination": destination,
         "budget": budget,
+        "payment": payment,
         "notes": notes,
         "result": result
     }
+    st.session_state.counters["cases"] += 1
     st.session_state["show_latest_result"] = True
 
 if st.session_state.get("show_latest_result") and st.session_state.last_trade_case:
@@ -637,30 +977,40 @@ if st.session_state.get("show_latest_result") and st.session_state.last_trade_ca
         provider = st.session_state.last_provider or "Demo"
         model = st.session_state.last_model or ""
         st.caption(f"🤖 AI Provider: {provider} • {model}" if model else f"🤖 AI Provider: {provider}")
+        if st.session_state.fallback_note:
+            st.caption(f"↪ fallback used — {st.session_state.fallback_note}")
         st.markdown(st.session_state.last_trade_case["result"])
+    mp = st.session_state.get("market_price_result")
+    if mp and mp.get("text"):
+        with st.expander("📊 Market price research / تحقیق قیمت بازار"):
+            if mp.get("data"):
+                d = mp["data"]
+                st.caption(f"Benchmark traced to sources: USD {d['low']:,.2f} – {d['high']:,.2f} per kg (unverified; confirm with real quotations)")
+            st.markdown(strip_machine_line(mp["text"]))
 
 # -------------------------- calculator ------------------------
 st.markdown(f'<div class="section-title">{T["pricing_title"]}</div>', unsafe_allow_html=True)
+mp_calc = st.session_state.get("market_price_result")
+if mp_calc and mp_calc.get("data"):
+    d = mp_calc["data"]
+    st.caption(f"Market benchmark (unverified, from search sources): USD {d['low']:,.2f} – {d['high']:,.2f} per kg. Enter YOUR actual purchase price below.")
 q1, q2, q3 = st.columns(3)
 with q1:
-    calc_qty = st.text_input(T["quantity"], value=quantity if 'quantity' in locals() else "20", key="calc_qty")
+    calc_qty = st.text_input(T["quantity"], key="calc_qty")
     calc_unit = st.text_input(T["purchase_unit"], placeholder="مثال: 80 USD/kg", key="calc_unit")
-    calc_inland = st.text_input(T["inland"], value="0", key="calc_inland")
-    calc_freight = st.text_input(T["freight"], value="0", key="calc_freight")
+    calc_inland = st.text_input(T["inland"], key="calc_inland")
+    calc_freight = st.text_input(T["freight"], key="calc_freight")
 with q2:
-    calc_ins = st.text_input(T["insurance"], value="0", key="calc_ins")
-    calc_duty = st.text_input(T["duty"], value="0", key="calc_duty")
-    calc_vat = st.text_input(T["vat"], value="0", key="calc_vat")
-    calc_bank = st.text_input(T["bank"], value="0", key="calc_bank")
+    calc_ins = st.text_input(T["insurance"], key="calc_ins")
+    calc_duty = st.text_input(T["duty"], key="calc_duty")
+    calc_vat = st.text_input(T["vat"], key="calc_vat")
+    calc_bank = st.text_input(T["bank"], key="calc_bank")
 with q3:
-    calc_other = st.text_input(T["other"], value="0", key="calc_other")
-    calc_margin = st.text_input(T["margin"], value="10", key="calc_margin")
+    calc_other = st.text_input(T["other"], key="calc_other")
+    calc_margin = st.text_input(T["margin"], key="calc_margin")
     if st.button(T["calculate"], type="secondary", use_container_width=True):
         calc, err = calculate_price(calc_qty, calc_unit, calc_inland, calc_freight, calc_ins, calc_duty, calc_vat, calc_bank, calc_other, calc_margin)
-        if err:
-            st.session_state.calc_result = (None, err)
-        else:
-            st.session_state.calc_result = (calc, None)
+        st.session_state.calc_result = (None, err) if err else (calc, None)
 
 if st.session_state.calc_result:
     calc, err = st.session_state.calc_result
@@ -672,33 +1022,34 @@ if st.session_state.calc_result:
 
 # ---------------------- live research -------------------------
 st.markdown(f'<div class="section-title">{T["research"]}</div>', unsafe_allow_html=True)
+st.caption(T["research_caption"])
+if product and not st.session_state.research_product:
+    st.session_state["research_product"] = product
+if destination and st.session_state.research_market == "Oman":
+    st.session_state["research_market"] = destination
+
 r1, r2, r3 = st.columns(3)
 with r1:
-    research_mode = st.selectbox("Research type / نوع تحقیق", [T["buyer_research"], T["supplier_research"], T["customs"]])
+    research_mode = st.selectbox(
+        "Research type / نوع تحقیق", ["buyers", "suppliers", "customs"],
+        format_func=lambda k: {"buyers": T["buyer_research"], "suppliers": T["supplier_research"], "customs": T["customs"]}[k],
+    )
 with r2:
-    research_product = st.text_input("Product / کالا", value=product if 'product' in locals() else "", key="research_product")
+    research_product = st.text_input("Product / کالا", key="research_product")
 with r3:
-    research_market = st.text_input("Market / بازار", value=destination if 'destination' in locals() else "Oman", key="research_market")
+    research_market = st.text_input("Market / بازار", key="research_market")
 
 if st.button(T["research_run"], use_container_width=True):
-    if not groq_ready:
-        st.warning("برای تحقیق زنده باید GROQ_API_KEY فعال باشد.")
+    if not research_product.strip():
+        st.warning("نام کالا را وارد کنید." if st.session_state.language == "FA" else "Enter a product name.")
     else:
-        if research_mode == T["buyer_research"]:
-            prompt = f"Find current potential BUYERS/importers for {research_product or 'product'} in {research_market or 'Oman'}. Use web search and return a markdown table of leads with source URLs."
-        elif research_mode == T["supplier_research"]:
-            prompt = f"Find current potential SUPPLIERS/producers for {research_product or 'product'} in {research_market or 'market'}. Use web search and return a markdown table with source URLs."
-        else:
-            prompt = f"Research CUSTOMS / IMPORT COMPLIANCE requirements for importing {research_product or 'product'} into {research_market or 'Oman'}. Cite official sources."
-        
         with st.spinner(T["research_working"]):
-            web_results = live_web_search(f"{research_product} {research_market} official website", limit=8)
-            if web_results:
-                prompt += "\n\nWEB SEARCH RESULTS:\n" + format_search_results(web_results)
-            research = call_ai(prompt, st.session_state.language, web_search=False)
-            if web_results:
-                research += "\n\n### منابع بازیابی‌شده\n" + "\n".join(f"- [{r['title']}]({r['url']})" for r in web_results)
+            research, n_sources = run_live_research(research_mode, research_product, research_market, st.session_state.language, ai_ready)
         st.session_state.research_result = research
+        if research_mode == "buyers":
+            st.session_state.counters["buyers"] += n_sources
+        elif research_mode == "suppliers":
+            st.session_state.counters["suppliers"] += n_sources
 
 if st.session_state.research_result:
     with st.container(border=True):
@@ -706,49 +1057,61 @@ if st.session_state.research_result:
 
 # ---------------------- invoice & document center with email & whatsapp ----------------------
 st.markdown('<div class="section-title">Invoice & Dispatch Center / صدور پیش‌فاکتور و ارسال به مشتری</div>', unsafe_allow_html=True)
-st.caption("صدور پیش‌فاکتور رسمی، دانلود PDF و ارسال مستقیم به ایمیل یا واتساپ مشتری.")
+st.caption("صدور پیش‌فاکتور رسمی، دانلود PDF و ارسال به ایمیل یا واتساپ مشتری. متن‌های داخل PDF باید انگلیسی باشند.")
 
-# اصلاح ایمن برای جلوگیری از ارور NoneType (رفع مشکل گزارش‌شده کاربر)
 last_case = st.session_state.get("last_trade_case") or {}
+
+
+def safe_default(v: str) -> str:
+    return v if pdf_safe(v) else ""
+
 
 with st.form("invoice_form"):
     inv_cols = st.columns(2)
     with inv_cols[0]:
         inv_type = st.selectbox("نوع سند", ["Proforma Invoice — Buyer", "Purchase Order — Supplier"])
         inv_no = st.text_input("شماره سند", value=f"MA-{date.today().strftime('%Y%m%d')}-001")
-        inv_seller = st.text_input("فروشنده / صادرکننده", value="Mehr Ara")
-        inv_buyer = st.text_input("نام خریدار / شرکت مقابل")
-        inv_product = st.text_input("شرح کالا", value=last_case.get("product", ""))
+        inv_seller = st.text_input("فروشنده / صادرکننده (English)", value="Mehr Ara")
+        inv_buyer = st.text_input("نام خریدار / شرکت مقابل (English)")
+        inv_product = st.text_input("شرح کالا (English)", value=safe_default(last_case.get("product", "")))
         customer_email = st.text_input("ایمیل مشتری (برای ارسال خودکار)", placeholder="client@example.com")
     with inv_cols[1]:
-        inv_qty = st.text_input("مقدار و واحد", value=last_case.get("quantity", ""))
+        inv_qty = st.text_input("مقدار و واحد", value=safe_default(last_case.get("quantity", "")))
         inv_unit_price = st.text_input("قیمت هر واحد (USD)", value="")
         customer_phone = st.text_input("شماره واتساپ مشتری (با کد کشور)", placeholder="+96891234567")
         inv_incoterm = st.selectbox("Incoterm", ["EXW", "FCA", "FOB", "CFR", "CIF", "DAP", "DDP"], index=4)
-        inv_payment = st.text_input("شرایط پرداخت", value="LC at Sight / T.T.")
+        inv_payment = st.text_input("شرایط پرداخت (الزامی، English)", value=safe_default(last_case.get("payment", "")))
         inv_validity = st.text_input("اعتبار پیش‌فاکتور", value="7 days")
-    
+
     inv_confirm = st.checkbox("اطلاعات پیش‌فاکتور، مشخصات کالا و قیمت‌ها را بازبینی و تایید می‌کنم.")
     inv_submit = st.form_submit_button("تولید نهایی پیش‌فاکتور و آماده‌سازی ارسال", type="primary", use_container_width=True)
 
 if inv_submit:
     qv = parse_number(inv_qty)
     uv = parse_number(inv_unit_price)
+    pdf_fields = {
+        "document type": inv_type, "document no.": inv_no, "seller": inv_seller, "buyer": inv_buyer,
+        "product": inv_product, "quantity": inv_qty, "payment terms": inv_payment, "validity": inv_validity,
+    }
+    non_latin = [k for k, v in pdf_fields.items() if not pdf_safe(v)]
     if not inv_confirm:
         st.error("لطفاً تایید اطلاعات پیش‌فاکتور را علامت بزنید.")
     elif not inv_product.strip() or not inv_buyer.strip() or qv is None or uv is None or qv <= 0 or uv < 0:
         st.error("شرح کالا، نام خریدار، مقدار و قیمت واحد معتبر الزامی است.")
+    elif not inv_payment.strip():
+        st.error("شرایط پرداخت را خودتان مشخص کنید (به‌صورت پیش‌فرض فرض نمی‌شود).")
+    elif non_latin:
+        st.error("PDF فقط حروف انگلیسی را پشتیبانی می‌کند. این فیلدها را انگلیسی بنویسید: " + ", ".join(non_latin))
     else:
         total = qv * uv
-        # ساخت PDF در حافظه
         buf = BytesIO()
         pdf = canvas.Canvas(buf, pagesize=A4)
         width, height = A4
         pdf.setTitle(inv_no)
         pdf.setFont("Helvetica-Bold", 18)
-        pdf.drawString(48, height-55, "MEHR ARA COMMERCIAL")
+        pdf.drawString(48, height - 55, "MEHR ARA COMMERCIAL")
         pdf.setFont("Helvetica-Bold", 14)
-        pdf.drawString(48, height-85, inv_type)
+        pdf.drawString(48, height - 85, inv_type)
         pdf.setFont("Helvetica", 10)
         rows = [
             ("Document No.", inv_no), ("Date", date.today().isoformat()),
@@ -766,44 +1129,41 @@ if inv_submit:
             pdf.drawString(180, y, str(value)[:95])
             y -= 25
         pdf.save()
-        pdf_bytes = buf.getvalue()
-        st.session_state["generated_pdf"] = pdf_bytes
+        st.session_state["generated_pdf"] = buf.getvalue()
         st.session_state["inv_details"] = {
-            "no": inv_no, "buyer": inv_buyer, "total": total, 
-            "email": customer_email, "phone": customer_phone, "product": inv_product
+            "no": inv_no, "buyer": inv_buyer, "total": total,
+            "email": customer_email.strip(), "phone": customer_phone, "product": inv_product
         }
         st.success(f"پیش‌فاکتور {inv_no} با موفقیت آماده شد! کل مبلغ: USD {total:,.2f}")
 
-# دکمه‌های دانلود، ارسال ایمیل و ارسال واتساپ (خارج از فرم برای تعامل روان)
 if "generated_pdf" in st.session_state and st.session_state.get("inv_details"):
     det = st.session_state["inv_details"]
     st.markdown("---")
     st.markdown("### 📤 ارسال و دانلود پیش‌فاکتور")
-    
+
     col_dl, col_em, col_wa = st.columns(3)
-    
+
     with col_dl:
         st.download_button(
-            "📥 دانلود فایل PDF پیش‌فاکتور", 
-            data=st.session_state["generated_pdf"], 
-            file_name=f"{det['no']}.pdf", 
-            mime="application/pdf", 
+            "📥 دانلود فایل PDF پیش‌فاکتور",
+            data=st.session_state["generated_pdf"],
+            file_name=f"{det['no']}.pdf",
+            mime="application/pdf",
             use_container_width=True
         )
-        
+
     with col_em:
         if st.button("📧 ارسال پیش‌فاکتور به ایمیل", use_container_width=True):
-            if not det["email"]:
-                st.error("لطفاً ایمیل مشتری را وارد کنید.")
+            if not det["email"] or not EMAIL_RE.fullmatch(det["email"]):
+                st.error("ایمیل مشتری را درست وارد کنید.")
             else:
                 try:
-                    # خواندن تنظیمات SMTP از Streamlit Secrets
                     smtp_server = get_secret("SMTP_SERVER", "smtp.gmail.com")
                     smtp_port = int(get_secret("SMTP_PORT", "587"))
                     smtp_user = get_secret("SMTP_USER")
                     smtp_pass = get_secret("SMTP_PASSWORD")
                     sender_email = get_secret("SENDER_EMAIL", smtp_user)
-                    
+
                     if not smtp_user or not smtp_pass:
                         st.error("تنظیمات SMTP (ایمیل فرستنده، نام کاربری و رمز عبور) در Secrets تنظیم نشده است.")
                     else:
@@ -812,10 +1172,9 @@ if "generated_pdf" in st.session_state and st.session_state.get("inv_details"):
                         msg["From"] = sender_email
                         msg["To"] = det["email"]
                         msg.set_content(f"Dear {det['buyer']},\n\nPlease find attached the Proforma Invoice {det['no']} for {det['product']}.\nTotal Amount: USD {det['total']:,.2f}.\n\nBest regards,\nMehr Ara Trade Team")
-                        
                         msg.add_attachment(st.session_state["generated_pdf"], maintype="application", subtype="pdf", filename=f"{det['no']}.pdf")
-                        
-                        with smtplib.SMTP(smtp_server, smtp_port) as server:
+
+                        with smtplib.SMTP(smtp_server, smtp_port, timeout=30) as server:
                             server.starttls()
                             server.login(smtp_user, smtp_pass)
                             server.send_message(msg)
@@ -824,14 +1183,13 @@ if "generated_pdf" in st.session_state and st.session_state.get("inv_details"):
                     st.error(f"خطا در ارسال ایمیل: {e}")
 
     with col_wa:
-        if st.button("💬 ارسال لینک/پیام به واتساپ", use_container_width=True):
-            if not det["phone"]:
-                st.error("لطفاً شماره واتساپ مشتری را وارد کنید.")
-            else:
-                wa_msg = quote_plus(f"سلام {det['buyer']} عزیز، پیش‌فاکتور شماره {det['no']} به مبلغ USD {det['total']:,.2f} برای کالا ({det['product']}) صادر گردید. لطفاً فایل را بررسی فرمایید. - گروه بازرگانی مهرآرا")
-                clean_phone = re.sub(r"\D", "", det["phone"])
-                whatsapp_url = f"https://wa.me/{clean_phone}?text={wa_msg}"
-                st.markdown(f'<a href="{whatsapp_url}" target="_blank"><button style="width:100%; background-color:#25D366; color:white; border:none; padding:10px; border-radius:8px; font-weight:bold; cursor:pointer;">کلیک برای ارسال در واتساپ ↗</button></a>', unsafe_allow_html=True)
+        clean_phone = re.sub(r"\D", "", det["phone"] or "")
+        if clean_phone:
+            wa_msg = quote_plus(f"سلام {det['buyer']} عزیز، پیش‌فاکتور شماره {det['no']} به مبلغ USD {det['total']:,.2f} برای کالا ({det['product']}) صادر شد. فایل پیش‌فاکتور را جداگانه برایتان ارسال می‌کنم. - گروه بازرگانی مهرآرا")
+            st.link_button("💬 باز کردن واتساپ با پیام آماده", f"https://wa.me/{clean_phone}?text={wa_msg}", use_container_width=True)
+            st.caption("واتساپ فقط متن را پیش‌پر می‌کند؛ فایل PDF را بعد از باز شدن گفتگو دستی پیوست کنید.")
+        else:
+            st.caption("شماره واتساپ مشتری را در فرم وارد کنید.")
 
 # ----------------------------- chat ----------------------------
 st.markdown(f'<div class="section-title">{T["assistant"]}</div>', unsafe_allow_html=True)
@@ -846,11 +1204,24 @@ if user_message:
     context = ""
     if st.session_state.last_trade_case:
         tc = st.session_state.last_trade_case
-        context = f"Current case: Product={tc['product']}; Quantity={tc['quantity']}; Origin={tc['origin']}; Destination={tc['destination']}"
+        context = (f"Current case: Product={tc['product']}; Quantity={tc['quantity']}; Origin={tc['origin']}; "
+                   f"Destination={tc['destination']}; Payment terms={tc.get('payment') or 'not specified'}")
     prior = st.session_state.chat_history[:-1][-8:]
-    answer = call_ai(f"{context}\nUser follow-up: {user_message}", st.session_state.language, prior, web_search=bool(groq_ready))
+    answer = call_ai(f"{context}\n{hs_instruction((st.session_state.last_trade_case or {}).get('product', ''))}\nUser follow-up: {user_message}",
+                     st.session_state.language, prior, web_search=bool(groq_ready))
+    allowed_chat = context + " " + " ".join(m["content"] for m in st.session_state.chat_history if m["role"] == "user")
+    answer = scrub_unverified(answer, allowed_chat, scrub_links=False)
     st.session_state.chat_history.append({"role": "assistant", "content": answer})
     st.rerun()
+
+with st.expander("Diagnostics"):
+    st.write({
+        "provider": st.session_state.last_provider,
+        "model": st.session_state.last_model,
+        "fallback_note": st.session_state.fallback_note,
+        "last_error": st.session_state.last_error,
+        "search_engine": st.session_state.search_engine,
+    })
 
 st.markdown("---")
 st.markdown(f'<div class="warning-box">⚠️ {T["demo_notice"]}</div>', unsafe_allow_html=True)
