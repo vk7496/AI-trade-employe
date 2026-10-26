@@ -1,5 +1,7 @@
 import os
 import re
+import json
+import hmac
 import base64
 import smtplib
 from email.message import EmailMessage
@@ -10,15 +12,21 @@ from typing import Optional, Tuple, List, Dict
 import httpx
 import streamlit as st
 from io import BytesIO
-from datetime import date
+from datetime import date, timedelta
 from reportlab.lib.pagesizes import A4
+from reportlab.lib.utils import simpleSplit
 from reportlab.pdfgen import canvas
 
 # ============================================================
-# MEHR ARA AI TRADE EMPLOYEE
+# MEHR ARA AI TRADE EMPLOYEE  (v2)
 # Groq primary -> OpenRouter backup -> Demo fallback
 # Live research (Tavily if configured, else Bing/DDG scraping),
-# fixed HS table, anti-fabrication guards, PDF, Email/WhatsApp.
+# fixed HS table, anti-fabrication guards, deterministic price
+# normalization, PDF, Email/WhatsApp.
+#
+# Optional secrets: GROQ_API_KEY, OPENROUTER_API_KEY, TAVILY_API_KEY,
+# APP_PASSWORD (recommended: protects your API keys / SMTP),
+# SMTP_SERVER, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, SENDER_EMAIL
 # ============================================================
 
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
@@ -28,7 +36,7 @@ st.set_page_config(
     page_title="Mehr Ara AI Trade Employee",
     page_icon="🤖",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="auto",  # collapsed automatically on phones
 )
 
 LANG = {
@@ -43,12 +51,15 @@ LANG = {
         "request": "Trade Request", "product": "Product", "quantity": "Quantity", "origin": "Origin",
         "destination": "Destination", "budget": "Budget / Target Price", "notes": "Additional Requirements",
         "payment": "Payment terms (you decide)",
+        "incoterm": "Incoterm (you decide)",
+        "fx": "FX rate (1 USD = ? IRT) — optional",
         "generate": "Generate Trade Plan", "result": "AI Employee Result", "chat": "Ask your AI Trade Employee",
         "message": "Message", "working": "AI Trade Employee is preparing the work...",
         "pricing_title": "Commercial Price Calculator", "calculate": "Calculate Commercial Price",
+        "calc_currency": "Currency of ALL amounts below",
         "purchase_unit": "Purchase price / unit", "inland": "Inland transport", "freight": "International freight",
         "insurance": "Insurance", "duty": "Customs duty %", "vat": "Import VAT %", "bank": "Bank / LC fee %",
-        "other": "Other costs", "margin": "Target margin %", "research": "Live Trade Research",
+        "other": "Other costs", "margin": "Target margin % (of sale price)", "research": "Live Trade Research",
         "research_caption": "Searches the web for current companies and official sources. Only sources actually retrieved are shown.",
         "research_run": "Research Now", "customs": "Customs & Compliance", "buyer_research": "Find Buyers",
         "supplier_research": "Find Suppliers", "research_working": "Searching current sources...",
@@ -65,12 +76,15 @@ LANG = {
         "request": "درخواست بازرگانی", "product": "کالا", "quantity": "مقدار", "origin": "مبدأ",
         "destination": "مقصد", "budget": "بودجه / قیمت هدف", "notes": "نیازمندی‌های بیشتر",
         "payment": "شرایط پرداخت (خودتان تعیین کنید)",
+        "incoterm": "Incoterm (خودتان تعیین کنید)",
+        "fx": "نرخ ارز (۱ دلار = ؟ تومان) — اختیاری",
         "generate": "ساخت برنامه بازرگانی", "result": "خروجی نیروی هوشمند", "chat": "از نیروی هوشمند بازرگانی بپرسید",
         "message": "پیام", "working": "نیروی هوشمند در حال آماده‌سازی نتیجه است...",
         "pricing_title": "محاسبه‌گر قیمت تجاری", "calculate": "محاسبه قیمت",
+        "calc_currency": "ارز همه مبالغ زیر",
         "purchase_unit": "قیمت خرید هر واحد", "inland": "حمل داخلی", "freight": "حمل بین‌المللی",
         "insurance": "بیمه", "duty": "حقوق و عوارض گمرکی %", "vat": "مالیات واردات / VAT %", "bank": "کارمزد بانک / LC %",
-        "other": "سایر هزینه‌ها", "margin": "حاشیه سود هدف %", "research": "تحقیق زنده بازرگانی",
+        "other": "سایر هزینه‌ها", "margin": "حاشیه سود هدف % (از قیمت فروش)", "research": "تحقیق زنده بازرگانی",
         "research_caption": "برای یافتن شرکت‌ها و منابع رسمی در وب جستجو می‌شود. فقط منابعی که واقعاً بازیابی شده‌اند نمایش داده می‌شوند.",
         "research_run": "شروع تحقیق", "customs": "گمرک و انطباق", "buyer_research": "پیدا کردن خریدار",
         "supplier_research": "پیدا کردن تأمین‌کننده", "research_working": "در حال جستجوی منابع به‌روز...",
@@ -93,6 +107,7 @@ HS_TABLE = [
      "0102.21 (pure-bred breeding) / 0102.29 (other)", "Live bovine animals"),
 ]
 HS_RE = re.compile(r"\b\d{4}\.\d{2}(?:\.\d{2})?\b")
+HS_CONTEXT_RE = re.compile(r"(?i)\bhs\b|hs\s*code|harmonized|tariff|کد|تعرفه")
 
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
 URL_RE = re.compile(r"https?://[^\s)\]>\"'|]+")
@@ -101,6 +116,16 @@ PHONE_RES = [
     re.compile(r"(?<!\d)09\d{9}(?!\d)"),
     re.compile(r"(?<!\d)0\d{2,3}[\s\-]\d{7,8}(?!\d)"),
 ]
+
+# currencies / units used by the deterministic price normalizer
+CURRENCIES = ["USD", "EUR", "AED", "OMR", "IRT", "IRR"]
+PEG = {"USD": 1.0, "AED": 3.6725, "OMR": 0.3845}  # units of currency per 1 USD (official pegs)
+UNIT_TO_KG = {"kg": 1.0, "g": 1000.0, "100g": 10.0, "mithqal": 1000.0 / 4.608}  # multiply price/unit -> price/kg
+CUR_WORDS = {"usd": "USD", "$": "USD", "دلار": "USD", "eur": "EUR", "€": "EUR", "یورو": "EUR",
+             "aed": "AED", "درهم": "AED", "omr": "OMR", "irt": "IRT", "تومان": "IRT",
+             "irr": "IRR", "ریال": "IRR"}
+IRAN_KEYS = ["iran", "tehran", "mashhad", "shiraz", "isfahan", "tabriz", "ایران", "تهران", "مشهد", "شیراز", "اصفهان", "تبریز"]
+INCOTERMS = ["EXW", "FCA", "FOB", "CFR", "CIF", "DAP", "DDP"]
 
 # ----------------------------- state --------------------------
 for key, default in {
@@ -119,6 +144,7 @@ for key, default in {
     "counters": {"cases": 0, "buyers": 0, "suppliers": 0},
     "calc_qty": "",
     "calc_unit": "",
+    "calc_cur": "USD",
     "calc_inland": "0",
     "calc_freight": "0",
     "calc_ins": "0",
@@ -129,6 +155,8 @@ for key, default in {
     "calc_margin": "10",
     "research_product": "",
     "research_market": "Oman",
+    "authed": False,
+    "emails_sent": 0,
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
@@ -146,6 +174,28 @@ def get_secret(name: str, default: Optional[str] = None) -> Optional[str]:
 
 def has_key(name: str) -> bool:
     return bool((get_secret(name) or "").strip())
+
+
+def check_password() -> bool:
+    """If APP_PASSWORD is set in Secrets, require it. Protects your API keys and SMTP."""
+    expected = (get_secret("APP_PASSWORD") or "").strip()
+    if not expected or st.session_state.get("authed"):
+        return True
+    st.markdown("### 🔒 Mehr Ara AI Trade Employee")
+    with st.form("login_form"):
+        pw = st.text_input("Password / رمز عبور", type="password")
+        ok = st.form_submit_button("Login / ورود")
+    if ok:
+        if hmac.compare_digest(pw.encode("utf-8"), expected.encode("utf-8")):
+            st.session_state.authed = True
+            st.rerun()
+        else:
+            st.error("رمز اشتباه است. / Wrong password.")
+    return False
+
+
+if not check_password():
+    st.stop()
 
 
 def normalize_digits(value: str) -> str:
@@ -177,6 +227,22 @@ def pct(x: float) -> str:
 def pdf_safe(value: str) -> bool:
     """Helvetica in the PDF can only render Latin-1 text."""
     return all(ord(c) < 256 for c in (value or ""))
+
+
+def detect_currencies(text: str) -> set:
+    t = (text or "").lower()
+    found = set()
+    for k, v in CUR_WORDS.items():
+        if re.fullmatch(r"[a-z]+", k):
+            if re.search(rf"(?<![a-z]){k}(?![a-z])", t):
+                found.add(v)
+        elif k in t:
+            found.add(v)
+    return found
+
+
+def involves_iran(*values: str) -> bool:
+    return any(_has_any(v or "", IRAN_KEYS) for v in values)
 
 
 # ---------------- output cleaning / anti-fabrication guards ----------------
@@ -241,8 +307,17 @@ def hs_instruction(product: str) -> str:
             "write 'HS Code: official classification required'.")
 
 
+def find_hs_codes(text: str) -> set:
+    """Only lines that talk about HS / tariff / کد are inspected, so prices like 5000.00 are not mistaken for HS codes."""
+    codes = set()
+    for line in normalize_digits(text or "").splitlines():
+        if HS_CONTEXT_RE.search(line):
+            codes |= {c[:7] for c in HS_RE.findall(line)}
+    return codes
+
+
 def hs_guard(text: str, product: str, language: str) -> str:
-    found = {c[:7] for c in HS_RE.findall(normalize_digits(text or ""))}
+    found = find_hs_codes(text)
     if not found:
         return text
     hit = lookup_hs(product)
@@ -265,7 +340,8 @@ def strip_machine_line(text: str) -> str:
 
 def numbers_in(text: str) -> List[float]:
     vals = []
-    for m in re.finditer(r"\d[\d,]*(?:\.\d+)?", normalize_digits(text or "")):
+    cleaned = normalize_digits(text or "").replace("٬", "")
+    for m in re.finditer(r"\d[\d,]*(?:\.\d+)?", cleaned):
         try:
             vals.append(float(m.group(0).replace(",", "")))
         except ValueError:
@@ -273,13 +349,8 @@ def numbers_in(text: str) -> List[float]:
     return vals
 
 
-def price_supported(low: float, high: float, source_text: str) -> bool:
-    nums = numbers_in(source_text)
-
-    def has(x: float) -> bool:
-        return any(abs(n - x) <= max(0.01, x * 0.005) for n in nums)
-
-    return has(low) and has(high)
+def number_in_text(x: float, text: str) -> bool:
+    return any(abs(n - x) <= max(0.01, x * 0.005) for n in numbers_in(text))
 
 
 # ---------------- web search ----------------
@@ -459,10 +530,11 @@ def live_web_search(query: str, limit: int = 6) -> List[Dict[str, str]]:
     return []
 
 
-def multi_search(queries: List[str], limit: int = 10) -> List[Dict[str, str]]:
+def multi_search(queries: List[str], limit: int = 10, per_query: Optional[int] = None) -> List[Dict[str, str]]:
+    per = per_query or limit
     merged, seen = [], set()
     for q in queries:
-        for r in live_web_search(q, limit=limit):
+        for r in live_web_search(q, limit=per):
             if r["url"] not in seen:
                 seen.add(r["url"])
                 merged.append(r)
@@ -482,7 +554,9 @@ def format_search_results(results: List[Dict[str, str]]) -> str:
 
 def sources_table(results: List[Dict[str, str]], language: str) -> str:
     def esc(x: str, n: int = 160) -> str:
-        return (x or "").replace("|", "/").replace("\n", " ").replace("[", "(").replace("]", ")")[:n]
+        x = re.sub(r"[#*_>`~]+", "", x or "")          # strip leaked markdown from snippets
+        x = re.sub(r"\s+", " ", x).strip()
+        return x.replace("|", "/").replace("[", "(").replace("]", ")")[:n]
 
     if language == "FA":
         head = "| # | منبع | خلاصه |\n|---|---|---|\n"
@@ -495,12 +569,50 @@ def sources_table(results: List[Dict[str, str]], language: str) -> str:
     return head + "\n".join(rows)
 
 
-def filter_relevant(results: List[Dict[str, str]], keywords: List[str]) -> List[Dict[str, str]]:
-    """Keep only results whose title/snippet mention the product (any keyword)."""
-    keys = [k.strip().lower() for k in keywords if k and k.strip()]
+def _has_any(text: str, keys: List[str]) -> bool:
+    t = (text or "").lower()
+    for k in keys:
+        k = (k or "").strip().lower()
+        if k and re.search(rf"(?<![a-z0-9]){re.escape(k)}(?![a-z0-9])", t):
+            return True
+    return False
+
+
+MARKET_ALIASES = {
+    "oman": ["oman", "muscat", "salalah", "sohar", "عمان", "مسقط", "صلالة", "صحار"],
+    "uae": ["uae", "united arab emirates", "dubai", "abu dhabi", "sharjah", "الإمارات", "دبي", "امارات", "دبی"],
+    "turkey": ["turkey", "türkiye", "turkiye", "istanbul", "ankara", "ترکیه", "استانبول", "آنکارا"],
+    "iran": ["iran", "tehran", "mashhad", "ایران", "تهران", "مشهد"],
+}
+AR_NAMES = {"Saffron": "زعفران", "Kiwifruit": "كيوي", "Pistachios": "فستق", "Dates": "تمر",
+            "Raisins": "زبيب", "Live bovine animals": "أبقار"}
+INFO_HOSTS = ("wikipedia.org", "webmd.com", "clevelandclinic.org", "healthline.com", "mayoclinic.org",
+              "britannica.com", "medicalnewstoday.com", "verywellhealth.com", "naturalremedyideas.com")
+GULF_WORDS = ("oman", "uae", "dubai", "abu dhabi", "qatar", "kuwait", "bahrain", "saudi", "muscat",
+              "عمان", "مسقط", "امارات", "دبی", "قطر", "کویت", "بحرین", "عربستان")
+
+
+def market_keywords(market: str) -> List[str]:
+    m = (market or "").strip().lower()
+    keys = [m] if m else []
+    for name, aliases in MARKET_ALIASES.items():
+        if _has_any(m, [name] + aliases):
+            keys += aliases
+    return list(dict.fromkeys(k for k in keys if k))
+
+
+def filter_relevant(results: List[Dict[str, str]], keywords: List[str],
+                    also: Optional[List[str]] = None) -> List[Dict[str, str]]:
+    """Keep results that mention the product (any keyword) AND, if given, the market (any `also` keyword)."""
+    keys = [k for k in keywords if k and k.strip()]
     if not keys:
         return results
-    return [r for r in results if any(k in f"{r.get('title','')} {r.get('snippet','')}".lower() for k in keys)]
+    out = []
+    for r in results:
+        blob = f"{r.get('title', '')} {r.get('snippet', '')} {r.get('url', '')}"
+        if _has_any(blob, keys) and (not also or _has_any(blob, also)):
+            out.append(r)
+    return out
 
 
 # ---------------- AI ----------------
@@ -519,9 +631,11 @@ This is a clearly labeled demo response. Live prices, duties, taxes, freight, co
 def clean_farsi_prompt(language: str) -> str:
     if language == "FA":
         return """پاسخ را کاملاً به فارسی طبیعی و حرفه‌ای بنویس. از فارسی استاندارد استفاده کن. اصطلاحات استاندارد تجارت بین‌الملل مانند USD, kg, MT, FOB, CIF, CFR, EXW, LC, RFQ و HS Code را در لاتین نگه دار.
-فقط Markdown ساده بنویس: هرگز تگ HTML (مثل <br>) ننویس. عنوان‌ها را با ## و بدون شماره‌گذاری (بدون «1.» یا «۲.») بنویس. جدول‌ها را کوتاه، خوانا و با سلول‌های تک‌خطی بنویس."""
+فقط Markdown ساده بنویس: هرگز تگ HTML (مثل <br>) ننویس. عنوان‌ها را با ## و بدون شماره‌گذاری (بدون «1.» یا «۲.») بنویس. جدول‌ها را کوتاه، خوانا و با سلول‌های تک‌خطی بنویس.
+اعداد را با جداکننده هزارگان بنویس (مثلاً 5,600,000) و واحد را بعد از عدد با یک فاصله بیاور (مثلاً 10 kg، 18,000 USD)."""
     return ("Write clear professional English with consistent terminology and readable Markdown tables. "
-            "Plain Markdown only: never use HTML tags such as <br>. Use ## headings WITHOUT numbering. Keep table cells single-line.")
+            "Plain Markdown only: never use HTML tags such as <br>. Use ## headings WITHOUT numbering. Keep table cells single-line. "
+            "Write numbers with thousands separators (5,600,000) and put the unit after the number with a space (10 kg, 18,000 USD).")
 
 
 def provider_call(provider: str, model: str, prompt: str, language: str, history=None, web_search=False) -> Tuple[bool, str, str]:
@@ -540,11 +654,12 @@ Today's date: {date.today().isoformat()}.
 Reliability and compliance rules:
 - Never invent a real company, person, phone, WhatsApp, email, website, quotation, stock level, market price, freight rate, tariff, tax, permit, certificate, legal requirement or customs procedure.
 - Name a company, website, email or phone ONLY if it appears verbatim in sources supplied to you in this conversation. Never output placeholders such as example.com, xxx or info@company.
-- Never assume the payment method, Incoterm, price, currency or quantity unit. Use only what the user provided; if something is missing, list it under 'must be specified by the user' instead of choosing a default (do not default to LC).
+- Never assume the payment method, Incoterm, price, currency, FX rate or quantity unit. Use only what the user provided; if something is missing, list it under 'must be specified by the user' instead of choosing a default (do not default to LC).
 - Clearly distinguish: 1) User-provided facts, 2) Estimate/assumption, 3) Must verify.
 - For customs/legal questions, prefer official government/customs/tax sources. Do not present a legal requirement as confirmed unless an authoritative source supports it.
 - For pricing, show arithmetic, units and formulas.
 - For HS Code, use ONLY the HS_REFERENCE given in the prompt. If none is given, write 'HS Code: official classification required'. Always label it 'candidate — official classification required'.
+- If Iran is the origin or destination, add a checklist item about banking / payment-channel / sanctions restrictions (including whether an LC is practical) and mark it 'must verify with bank and legal counsel'. Do not state specific sanctions rules as confirmed.
 """}]
     if history:
         messages.extend(history[-8:])
@@ -625,6 +740,7 @@ def call_ai(prompt: str, language: str, history=None, web_search=False) -> str:
     return demo_response(language)
 
 
+# ---------------- deterministic market-price normalization ----------------
 def extract_market_price(text: str):
     if not text:
         return None
@@ -641,50 +757,154 @@ def extract_market_price(text: str):
     return {"low": low, "high": high, "mid": (low + high) / 2.0}
 
 
-def market_price_research(product: str, quantity: str, origin: str, destination: str, language: str) -> str:
+def parse_json_array(text: str) -> List[Dict]:
+    t = re.sub(r"```(?:json)?", "", text or "")
+    m = re.search(r"\[.*\]", t, re.S)
+    if not m:
+        return []
+    try:
+        data = json.loads(m.group(0))
+    except Exception:
+        return []
+    return [d for d in data if isinstance(d, dict)] if isinstance(data, list) else []
+
+
+def normalize_quotes(quotes: List[Dict], results: List[Dict[str, str]], fx_rate: Optional[float]) -> Tuple[List[Dict], bool]:
+    """Python (not the LLM) verifies each price against the snippet and converts it to USD/kg.
+    Returns (rows, unit_mismatch_suspected)."""
+    rows = []
+    for q in quotes[:20]:
+        try:
+            idx = int(q.get("source"))
+        except (TypeError, ValueError):
+            continue
+        if not 1 <= idx <= len(results):
+            continue
+        r = results[idx - 1]
+        price = parse_number(str(q.get("price", "")))
+        cur = str(q.get("currency", "")).upper().strip()
+        unit = str(q.get("unit", "")).lower().strip()
+        row = {"src": idx, "host": urlparse(r["url"]).netloc.removeprefix("www."),
+               "price": price, "cur": cur, "unit": unit, "usd_kg": None, "status": "ok"}
+        blob = f"{r.get('title', '')} {r.get('snippet', '')}"
+        if price is None or price <= 0 or not number_in_text(price, blob):
+            row["status"] = "unsupported"
+        elif unit not in UNIT_TO_KG:
+            row["status"] = "unit_unclear"
+        else:
+            per_kg = price * UNIT_TO_KG[unit]
+            if cur in PEG:
+                row["usd_kg"] = per_kg / PEG[cur]
+            elif cur == "IRT" and fx_rate:
+                row["usd_kg"] = per_kg / fx_rate
+            elif cur == "IRR" and fx_rate:
+                row["usd_kg"] = per_kg / 10.0 / fx_rate
+            elif cur in ("IRT", "IRR"):
+                row["status"] = "needs_fx"
+            else:
+                row["status"] = "currency"
+        rows.append(row)
+
+    ok = [r for r in rows if r["status"] == "ok" and r["usd_kg"]]
+    mismatch = False
+    if len(ok) >= 2:
+        vals = sorted(r["usd_kg"] for r in ok)
+        if vals[-1] / vals[0] > 10:
+            mismatch = True
+            if len(ok) >= 3:
+                med = vals[len(vals) // 2]
+                for r in ok:
+                    if not (med / 3 <= r["usd_kg"] <= med * 3):
+                        r["status"] = "outlier"
+            else:
+                for r in ok:
+                    r["status"] = "conflict"
+    return rows, mismatch
+
+
+STATUS_TEXT = {
+    "FA": {"ok": "✅ پذیرفته شد", "unsupported": "❌ عدد در متن منبع نبود", "unit_unclear": "❌ واحد نامشخص",
+           "needs_fx": "⚠️ نرخ ارز لازم است", "currency": "❌ ارز قابل تبدیل نیست",
+           "outlier": "❌ پرت (احتمال اشتباه واحد)", "conflict": "❌ تناقض (احتمال اشتباه واحد)"},
+    "EN": {"ok": "✅ accepted", "unsupported": "❌ number not in source text", "unit_unclear": "❌ unit unclear",
+           "needs_fx": "⚠️ FX rate needed", "currency": "❌ currency not convertible",
+           "outlier": "❌ outlier (possible unit mismatch)", "conflict": "❌ conflict (possible unit mismatch)"},
+}
+
+
+def market_price_research(product: str, quantity: str, origin: str, destination: str, language: str,
+                          fx_rate: Optional[float] = None) -> str:
     year = date.today().year
     results = multi_search([
         f"wholesale B2B price {product} per kg supplier quotation {origin} {destination} {year}",
         f"{product} exporter wholesale price per kg quotation {year}",
     ], limit=8)
-    source_block = format_search_results(results)
     if not results:
         msg = ("**قیمت بازار تأیید نشد.** جست‌وجوی وب در این اجرا نتیجه قابل بازیابی نداد؛ هیچ قیمتی حدس زده نشد."
                if language == "FA" else
                "**Market price not verified.** Web search returned nothing; no price was guessed.")
         return msg + "\n\nMARKET_PRICE_RANGE_USD_PER_KG: UNAVAILABLE"
 
-    prompt = f"""You are the commercial market analyst for Mehr Ara AI Trade Employee.
-Analyze ONLY the web search results supplied below. Do not use outside knowledge for prices.
+    source_block = format_search_results(results)
+    prompt = f"""You extract price quotes from web search results for Mehr Ara.
+Use ONLY the results below. Never use outside knowledge for prices.
 Product: {product or 'not specified'}
-Quantity: {quantity or 'not specified'}
 Origin: {origin or 'not specified'}
 Destination: {destination or 'not specified'}
-Current date: {date.today().isoformat()}
 
-Search results retrieved now:
+Search results:
 {source_block}
 
-Write a short benchmark summary (which source says what price, in which unit/currency, any conversion you made).
-Then output exactly one machine-readable line, using only numbers that appear in the sources above:
-MARKET_PRICE_RANGE_USD_PER_KG: <low>-<high>
-Or if the sources do not clearly support a USD/kg range:
-MARKET_PRICE_RANGE_USD_PER_KG: UNAVAILABLE
-{clean_farsi_prompt(language)}"""
-    analysis = call_ai(prompt, language, web_search=False)
-    analysis = scrub_unverified(analysis, source_block, [r["url"] for r in results], scrub_links=True)
+Return ONLY a JSON array (no prose, no code fences). Each element:
+{{"source": <result number>, "price": <number exactly as written in that result>, "currency": "USD|AED|OMR|EUR|IRT|IRR|OTHER", "unit": "kg|g|100g|mithqal|unclear", "grade": "<short text>"}}
+Rules: include a price only if that exact number appears in the result's title or snippet. Use IRT for toman and IRR for rial. If the unit is not explicit use "unclear". Skip results that are not about this product. Return [] if there are none."""
+    raw = call_ai(prompt, "EN", web_search=False)
+    quotes = parse_json_array(raw)
+    rows, mismatch = normalize_quotes(quotes, results, fx_rate)
+    kept = [r["usd_kg"] for r in rows if r["status"] == "ok" and r["usd_kg"]]
+    stx = STATUS_TEXT["FA" if language == "FA" else "EN"]
 
-    data = extract_market_price(analysis)
-    if data and not price_supported(data["low"], data["high"], source_block):
-        analysis = re.sub(r"MARKET_PRICE_RANGE_USD_PER_KG\s*:.*", "MARKET_PRICE_RANGE_USD_PER_KG: UNAVAILABLE", analysis)
-        analysis += ("\n\n> ⚠️ بازه قیمت مدل در منابع بازیابی‌شده قابل ردیابی نبود و حذف شد."
-                     if language == "FA" else
-                     "\n\n> ⚠️ The model's price range could not be traced to the retrieved sources and was removed.")
-    if "MARKET_PRICE_RANGE_USD_PER_KG:" not in analysis:
-        analysis += "\n\nMARKET_PRICE_RANGE_USD_PER_KG: UNAVAILABLE"
+    if language == "FA":
+        title = "### قیمت‌های استخراج‌شده (تأییدنشده)"
+        head = "| # | منبع | قیمت در منبع | واحد | ≈ USD/kg | وضعیت |\n|---|---|---|---|---|---|\n"
+        none_msg = "هیچ قیمتی که هم در متن منبع باشد و هم قابل تبدیل به USD/kg باشد پیدا نشد؛ چیزی حدس زده نشد."
+        mm_msg = ("> ⚠️ قیمت‌های منابع بیش از ۱۰ برابر با هم فرق دارند؛ احتمالاً اشتباه واحد (مثقال/گرم/کیلو یا ریال/تومان) است. "
+                  "قیمت‌های مشکوک کنار گذاشته شد.")
+        sources_heading = "### منابع جست‌وجوشده"
+        fx_msg = "> برای تبدیل تومان/ریال، «نرخ ارز» را در فرم درخواست وارد کنید."
+    else:
+        title = "### Extracted prices (unverified)"
+        head = "| # | Source | Price in source | Unit | ≈ USD/kg | Status |\n|---|---|---|---|---|---|\n"
+        none_msg = "No price was both present in a source text and convertible to USD/kg; nothing was guessed."
+        mm_msg = ("> ⚠️ Source prices differ by more than 10x; this is probably a unit mismatch "
+                  "(mithqal/gram/kg or rial/toman). Suspect prices were excluded.")
+        sources_heading = "### Sources searched"
+        fx_msg = "> To convert toman/rial, enter the FX rate in the request form."
 
-    heading = "### منابع جست‌وجوشده" if language == "FA" else "### Sources searched"
-    return analysis.strip() + f"\n\n{heading}\n" + sources_table(results, language)
+    lines = []
+    for r in rows:
+        price_txt = f"{r['price']:,.2f}".rstrip("0").rstrip(".") if r["price"] is not None else "-"
+        usd_txt = f"{r['usd_kg']:,.2f}" if r["usd_kg"] else "-"
+        lines.append(f"| {r['src']} | {r['host']} | {price_txt} {r['cur']} | {r['unit']} | {usd_txt} | {stx.get(r['status'], r['status'])} |")
+
+    parts = [title]
+    if rows:
+        parts.append(head + "\n".join(lines))
+    else:
+        parts.append(none_msg)
+    if mismatch:
+        parts.append(mm_msg)
+    if any(r["status"] == "needs_fx" for r in rows):
+        parts.append(fx_msg)
+    if rows and not kept:
+        parts.append(none_msg)
+
+    if kept:
+        parts.append(f"MARKET_PRICE_RANGE_USD_PER_KG: {min(kept):.2f}-{max(kept):.2f}")
+    else:
+        parts.append("MARKET_PRICE_RANGE_USD_PER_KG: UNAVAILABLE")
+    parts.append(f"{sources_heading}\n" + sources_table(results, language))
+    return "\n\n".join(parts)
 
 
 def run_live_research(mode: str, product: str, market: str, language: str, ai_ready: bool):
@@ -693,23 +913,37 @@ def run_live_research(mode: str, product: str, market: str, language: str, ai_re
     market = (market or "").strip() or "Oman"
     hit = lookup_hs(product)
     pq = hit["name"] if hit else product  # English name searches far better than Persian
+    ar = AR_NAMES.get(hit["name"]) if hit else None
+    is_gulf = any(g in market.lower() or g in market for g in GULF_WORDS)
     if mode == "buyers":
-        queries = [f"{pq} importer distributor buyer {market}", f"{pq} wholesale import company {market}"]
+        queries = [f"{pq} importers {market} company", f"{pq} wholesale trading LLC {market}",
+                   f"{pq} importer directory {market} contact"]
+        if ar and is_gulf:
+            queries.append(f"مستورد {ar} {market}")
     elif mode == "suppliers":
-        queries = [f"{pq} exporter producer supplier {market}", f"{pq} manufacturer wholesale {market}"]
+        queries = [f"{pq} exporter producer supplier {market}", f"{pq} manufacturer wholesale {market}",
+                   f"{pq} exporters directory {market}"]
     else:
         queries = [f"{market} customs import requirements {pq}", f"{market} import permit {pq} ministry official"]
 
-    raw_results = multi_search(queries, limit=12)
+    raw_results = multi_search(queries, limit=24, per_query=8)
     results = raw_results
     dropped = 0
     if mode in ("buyers", "suppliers") and raw_results:
-        results = filter_relevant(raw_results, [product] + ([hit["name"]] if hit else []))
-        dropped = len(raw_results) - len(results)
+        n_raw = len(raw_results)
+        kept = [r for r in raw_results
+                if not any(urlparse(r["url"]).netloc.lower().removeprefix("www.").endswith(h) for h in INFO_HOSTS)]
+        pk = [product] + ([hit["name"]] if hit else []) + ([ar] if ar else [])
+        results = filter_relevant(kept, pk, market_keywords(market))
+        dropped = n_raw - len(results)
         if not results:
-            msg = ("نتایج پیدا شد ولی هیچ‌کدام به این کالا اشاره نمی‌کردند، پس چیزی نمایش داده نمی‌شود. نام کالا را دقیق‌تر (ترجیحاً انگلیسی) بنویسید یا بازار را تغییر دهید."
+            msg = ("نتایج پیدا شد ولی هیچ‌کدام همزمان به کالا و بازار انتخاب‌شده اشاره نمی‌کردند، پس چیزی نمایش داده نمی‌شود (چیزی ساخته نشد). "
+                   "برای خریدار واقعی از Trade Map / UN Comtrade (فهرست کشورها و واردکنندگان)، دایرکتوری اتاق بازرگانی مقصد (مثلاً OCCI برای عمان) "
+                   "و فهرست غرفه‌داران نمایشگاه‌های غذایی/کشاورزی استفاده کنید."
                    if language == "FA" else
-                   "Results were found but none mentioned this product, so nothing is shown. Try a more specific (English) product name or another market.")
+                   "Results were found but none mentioned both the product and the chosen market, so nothing is shown (nothing was invented). "
+                   "For real buyers use Trade Map / UN Comtrade, the destination chamber-of-commerce directory (e.g. OCCI for Oman) "
+                   "and exhibitor lists of food/agri trade fairs.")
             return msg, 0
     if not results:
         msg = ("جست‌وجوی وب در این اجرا هیچ نتیجه‌ای بازیابی نکرد، بنابراین **هیچ شرکت یا اطلاعات تماسی نمایش داده نمی‌شود** (چیزی ساخته نشد). "
@@ -756,7 +990,9 @@ Task: {task}
     return analysis.strip() + "\n\n" + table, len(results)
 
 
-def calculate_price(quantity, unit_purchase, inland, freight, insurance, duty_pct, vat_pct, bank_pct, other, margin_pct):
+# ---------------- calculator ----------------
+def calculate_price(quantity, unit_purchase, inland, freight, insurance, duty_pct, vat_pct, bank_pct, other,
+                    margin_pct, currency="USD", language="FA"):
     q = parse_number(quantity)
     unit = parse_number(unit_purchase)
     vals = {
@@ -769,8 +1005,18 @@ def calculate_price(quantity, unit_purchase, inland, freight, insurance, duty_pc
         "other": parse_number(other) or 0,
         "margin_pct": parse_number(margin_pct) or 0,
     }
+    fa = language == "FA"
     if q is None or unit is None or q <= 0 or unit < 0:
-        return None, "برای محاسبه قطعی، مقدار و قیمت خرید هر واحد را وارد کنید."
+        return None, ("برای محاسبه قطعی، مقدار و قیمت خرید هر واحد را وارد کنید." if fa
+                      else "Enter a valid quantity and unit purchase price.")
+    detected = detect_currencies(unit_purchase)
+    if detected and currency not in detected:
+        return None, (f"قیمت خرید به نظر با ارز {', '.join(sorted(detected))} نوشته شده ولی ارز انتخاب‌شده {currency} است. "
+                      "ارز را درست انتخاب کنید یا قیمت را تبدیل کنید." if fa else
+                      f"The unit price looks like it is in {', '.join(sorted(detected))} but the selected currency is {currency}. "
+                      "Fix the currency or convert the price.")
+    if vals["margin_pct"] >= 100 or vals["margin_pct"] < 0:
+        return None, ("حاشیه سود باید بین ۰ و کمتر از ۱۰۰ باشد." if fa else "Margin must be between 0 and under 100.")
 
     goods = q * unit
     customs_value = goods + vals["freight"] + vals["insurance"]
@@ -780,51 +1026,141 @@ def calculate_price(quantity, unit_purchase, inland, freight, insurance, duty_pc
     pre_bank_cost = goods + vals["inland"] + vals["freight"] + vals["insurance"] + duty + vat + vals["other"]
     bank_fee = pre_bank_cost * vals["bank_pct"] / 100
     total_cost = pre_bank_cost + bank_fee
-    sale_price = total_cost * (1 + vals["margin_pct"] / 100)
+    sale_price = total_cost / (1 - vals["margin_pct"] / 100)   # true margin on the sale price
     unit_sale = sale_price / q
+    markup_pct = (sale_price / total_cost - 1) * 100 if total_cost else 0.0
 
     return {
-        "quantity": q, "unit_purchase": unit, "goods": goods,
+        "quantity": q, "unit_purchase": unit, "goods": goods, "currency": currency,
         "customs_value": customs_value, "duty": duty, "vat_base": vat_base,
         "vat": vat, "bank_fee": bank_fee, "total_cost": total_cost,
-        "sale_price": sale_price, "unit_sale": unit_sale, **vals,
+        "sale_price": sale_price, "unit_sale": unit_sale, "markup_pct": markup_pct, **vals,
     }, None
 
 
 def calculator_markdown(c, language):
+    cur = c["currency"]
     if language == "FA":
         return f"""### نتیجه محاسبه تجاری
 
 | ردیف | مبلغ |
 |---|---:|
-| ارزش کالا | {money(c['goods'])} |
-| حمل داخلی | {money(c['inland'])} |
-| حمل بین‌المللی | {money(c['freight'])} |
-| بیمه | {money(c['insurance'])} |
-| ارزش مبنای گمرکی مدل | {money(c['customs_value'])} |
-| حقوق و عوارض گمرکی | {money(c['duty'])} |
-| VAT / مالیات واردات | {money(c['vat'])} |
-| کارمزد بانک / LC | {money(c['bank_fee'])} |
-| سایر هزینه‌ها | {money(c['other'])} |
-| **هزینه نهایی مدل (Landed Cost)** | **{money(c['total_cost'])}** |
-| **قیمت فروش پیشنهادی با {pct(c['margin_pct'])} سود** | **{money(c['sale_price'])}** |
-| **قیمت فروش هر واحد** | **{money(c['unit_sale'])}** |"""
+| ارزش کالا | {money(c['goods'], cur)} |
+| حمل داخلی | {money(c['inland'], cur)} |
+| حمل بین‌المللی | {money(c['freight'], cur)} |
+| بیمه | {money(c['insurance'], cur)} |
+| ارزش مبنای گمرکی مدل | {money(c['customs_value'], cur)} |
+| حقوق و عوارض گمرکی | {money(c['duty'], cur)} |
+| VAT / مالیات واردات | {money(c['vat'], cur)} |
+| کارمزد بانک / LC | {money(c['bank_fee'], cur)} |
+| سایر هزینه‌ها | {money(c['other'], cur)} |
+| **هزینه نهایی مدل (Landed Cost)** | **{money(c['total_cost'], cur)}** |
+| **قیمت فروش پیشنهادی با حاشیه سود {pct(c['margin_pct'])}** | **{money(c['sale_price'], cur)}** |
+| معادل افزایش روی هزینه (Markup) | {pct(c['markup_pct'])} |
+| **قیمت فروش هر واحد** | **{money(c['unit_sale'], cur)}** |"""
     return f"""### Calculation Result
 
 | Item | Amount |
 |---|---:|
-| Goods value | {money(c['goods'])} |
-| Inland transport | {money(c['inland'])} |
-| International freight | {money(c['freight'])} |
-| Insurance | {money(c['insurance'])} |
-| Model customs value | {money(c['customs_value'])} |
-| Customs duty | {money(c['duty'])} |
-| Import VAT | {money(c['vat'])} |
-| Bank / LC fee | {money(c['bank_fee'])} |
-| Other costs | {money(c['other'])} |
-| **Model landed cost** | **{money(c['total_cost'])}** |
-| **Suggested sale price at {pct(c['margin_pct'])} margin** | **{money(c['sale_price'])}** |
-| **Suggested sale price / unit** | **{money(c['unit_sale'])}** |"""
+| Goods value | {money(c['goods'], cur)} |
+| Inland transport | {money(c['inland'], cur)} |
+| International freight | {money(c['freight'], cur)} |
+| Insurance | {money(c['insurance'], cur)} |
+| Model customs value | {money(c['customs_value'], cur)} |
+| Customs duty | {money(c['duty'], cur)} |
+| Import VAT | {money(c['vat'], cur)} |
+| Bank / LC fee | {money(c['bank_fee'], cur)} |
+| Other costs | {money(c['other'], cur)} |
+| **Model landed cost** | **{money(c['total_cost'], cur)}** |
+| **Suggested sale price at {pct(c['margin_pct'])} margin** | **{money(c['sale_price'], cur)}** |
+| Equivalent markup on cost | {pct(c['markup_pct'])} |
+| **Suggested sale price / unit** | **{money(c['unit_sale'], cur)}** |"""
+
+
+# ---------------- PDF ----------------
+def int_to_words(n: int) -> str:
+    if n == 0:
+        return "zero"
+    ones = ("one two three four five six seven eight nine ten eleven twelve thirteen fourteen "
+            "fifteen sixteen seventeen eighteen nineteen").split()
+    tens = "twenty thirty forty fifty sixty seventy eighty ninety".split()
+
+    def below1000(k: int) -> str:
+        parts = []
+        if k >= 100:
+            parts.append(ones[k // 100 - 1] + " hundred")
+            k %= 100
+        if k >= 20:
+            parts.append(tens[k // 10 - 2] + ("-" + ones[k % 10 - 1] if k % 10 else ""))
+        elif k > 0:
+            parts.append(ones[k - 1])
+        return " ".join(parts)
+
+    out = []
+    for name, size in (("billion", 10 ** 9), ("million", 10 ** 6), ("thousand", 1000)):
+        if n >= size:
+            out.append(below1000(n // size) + " " + name)
+            n %= size
+    if n:
+        out.append(below1000(n))
+    return " ".join(out)
+
+
+def amount_in_words(x: float) -> str:
+    whole = int(x)
+    cents = int(round((x - whole) * 100))
+    if cents == 100:
+        whole, cents = whole + 1, 0
+    s = f"{int_to_words(whole)} US dollars"
+    if cents:
+        s += f" and {cents:02d}/100"
+    return s.capitalize() + " only"
+
+
+def valid_until(validity: str) -> str:
+    m = re.search(r"(\d+)\s*day", (validity or "").lower())
+    if m:
+        return (date.today() + timedelta(days=int(m.group(1)))).isoformat()
+    return ""
+
+
+def make_pdf(d: Dict) -> bytes:
+    buf = BytesIO()
+    pdf = canvas.Canvas(buf, pagesize=A4)
+    W, H = A4
+    pdf.setTitle(d["no"])
+
+    def header():
+        pdf.setFont("Helvetica-Bold", 18)
+        pdf.drawString(48, H - 55, "MEHR ARA COMMERCIAL")
+        pdf.setFont("Helvetica-Bold", 14)
+        pdf.drawString(48, H - 82, d["type"].upper())
+        pdf.line(48, H - 92, W - 48, H - 92)
+
+    header()
+    y = H - 120
+    for label, value in d["rows"]:
+        lines = []
+        for part in (str(value).splitlines() or [""]):
+            lines += simpleSplit(part, "Helvetica", 10, W - 48 - 190) or [""]
+        if y - (14 * len(lines) + 6) < 120:
+            pdf.showPage()
+            header()
+            y = H - 120
+        pdf.setFont("Helvetica-Bold", 10)
+        pdf.drawString(48, y, label + ":")
+        pdf.setFont("Helvetica", 10)
+        for ln in lines:
+            pdf.drawString(190, y, ln)
+            y -= 14
+        y -= 6
+    pdf.line(48, 100, 230, 100)
+    pdf.setFont("Helvetica", 9)
+    pdf.drawString(48, 88, "Authorized signature / stamp")
+    pdf.setFont("Helvetica-Oblique", 8)
+    pdf.drawString(48, 62, "Prices and terms are subject to written confirmation. Generated by Mehr Ara AI Trade Employee.")
+    pdf.save()
+    return buf.getvalue()
 
 
 # ----------------------------- CSS ----------------------------
@@ -845,6 +1181,12 @@ BASE_CSS = """
 /* tables: scroll horizontally instead of being cut off on mobile */
 [data-testid="stMarkdownContainer"] table{display:block;max-width:100%;overflow-x:auto;border-collapse:collapse}
 [data-testid="stMarkdownContainer"] th,[data-testid="stMarkdownContainer"] td{vertical-align:top;padding:6px 10px;word-break:break-word}
+/* code blocks (e.g. the RFQ text) stay left-to-right and wrap instead of being cut off */
+[data-testid="stMarkdownContainer"] pre, [data-testid="stMarkdownContainer"] code{direction:ltr !important;text-align:left !important;white-space:pre-wrap !important;word-break:break-word}
+@media (max-width:640px){
+  .hero{padding:20px 18px}.hero-subtitle{font-size:14px}.metric-value{font-size:22px}
+  .metric-card,.action-card{min-height:auto;padding:14px}.section-title{font-size:19px}
+}
 </style>
 """
 
@@ -886,6 +1228,8 @@ with st.sidebar:
     st.success("✓ Groq API Ready" if groq_ready else "⚠ Groq API not configured")
     st.success("✓ OpenRouter API Ready" if or_ready else "○ OpenRouter backup not configured")
     st.success("✓ Tavily search Ready" if has_key("TAVILY_API_KEY") else "○ Tavily not configured (using basic scraping)")
+    if not has_key("APP_PASSWORD"):
+        st.warning("⚠ APP_PASSWORD not set: anyone with the link can use your API keys / SMTP.")
     st.divider()
     st.markdown("### Trade Employee\n\n• Sell & Source\n\n• Export Planning\n\n• Customs Check\n\n• Buyer/Supplier Search\n\n• PDF & Email/WhatsApp")
 
@@ -931,19 +1275,24 @@ with c1:
     product = st.text_input(T["product"], placeholder="مثال: زعفران نگین")
     quantity = st.text_input(T["quantity"], placeholder="مثال: 20 kg")
     origin = st.text_input(T["origin"], placeholder="مثال: Mashhad, Iran")
+    incoterm = st.selectbox(T["incoterm"], [""] + INCOTERMS, format_func=lambda x: x if x else "—")
 with c2:
     destination = st.text_input(T["destination"], placeholder="مثال: Muscat, Oman")
     budget = st.text_input(T["budget"], placeholder="مثال: USD 2,000")
     payment = st.text_input(T["payment"], placeholder="خالی بگذارید تا به‌عنوان «باید مشخص شود» ثبت شود")
+    fx_text = st.text_input(T["fx"], placeholder="مثال: 1,000,000")
     notes = st.text_area(T["notes"], placeholder="زمان تحویل، کیفیت، بسته‌بندی...", height=100)
 
 if st.button(T["generate"], type="primary", use_container_width=True):
     st.session_state.market_price_result = None
     market_text = ""
     market_data = None
+    fx_rate = parse_number(fx_text)
+    if fx_rate is not None and fx_rate <= 0:
+        fx_rate = None
     if product and quantity and ai_ready:
         with st.spinner("در حال جستجوی قیمت فعلی بازار..." if st.session_state.language == "FA" else "Researching market price..."):
-            market_text = market_price_research(product, quantity, origin, destination, st.session_state.language)
+            market_text = market_price_research(product, quantity, origin, destination, st.session_state.language, fx_rate)
         market_data = extract_market_price(market_text)
         st.session_state.market_price_result = {"text": market_text, "data": market_data, "product": product, "quantity": quantity, "destination": destination}
         if not str(st.session_state.get("calc_qty", "")).strip():
@@ -968,12 +1317,14 @@ Quantity: {quantity or 'Not provided'}
 Origin: {origin or 'Not provided'}
 Destination: {destination or 'Not provided'}
 Budget / target: {budget or 'Not provided'}
+Incoterm: {incoterm or 'NOT PROVIDED — must be specified by the user; do not assume one'}
+FX rate (toman per 1 USD): {fx_text.strip() if fx_text.strip() else 'NOT PROVIDED — must be specified by the user; do not guess an exchange rate'}
 Payment terms: {payment or 'NOT PROVIDED — must be specified by the user; do not assume LC or any other method'}
 Additional requirements: {notes or 'Not provided'}
 
 {hs_instruction(product)}
 
-LIVE MARKET PRICE RESEARCH:
+LIVE MARKET PRICE RESEARCH (already normalized and verified by code; do not recompute or invent other prices):
 {market_text or 'No live market price research available.'}
 
 {clean_farsi_prompt(st.session_state.language)}
@@ -981,16 +1332,16 @@ LIVE MARKET PRICE RESEARCH:
 Create an operational report with exactly these sections as ## headings (use these exact titles, no numbers):
 ## {sec[0]}
 ## {sec[1]} (table; mark every missing input as '{missing}')
-## {sec[2]} (only from the research above)
+## {sec[2]} (only from the research above; if it says UNAVAILABLE, say the benchmark could not be verified)
 ## {sec[3]}: describe TYPES of buyers/suppliers and channels only. Do NOT name specific companies, emails or phones here — named leads come only from the Live Trade Research section.
-## {sec[4]} (use HS_REFERENCE only; mark each item with one status: {status})
+## {sec[4]} (use HS_REFERENCE only; mark each item with one status: {status}; the HS Code row must read 'candidate (internal table) — official classification required', never 'verified')
 ## {sec[5]}
 ## {sec[6]}
 """
     with st.spinner(T["working"]):
-        result = call_ai(prompt, st.session_state.language, web_search=bool(groq_ready))
-    allowed = " ".join([market_text, product, quantity, origin, destination, budget, payment, notes])
-    result = scrub_unverified(result, allowed, scrub_links=False)
+        result = call_ai(prompt, st.session_state.language, web_search=False)
+    allowed = " ".join([market_text, product, quantity, origin, destination, budget, payment, incoterm, fx_text, notes])
+    result = scrub_unverified(result, allowed, URL_RE.findall(market_text or ""), scrub_links=True)
     result = hs_guard(result, product, st.session_state.language)
     st.session_state.last_trade_case = {
         "action": st.session_state.selected_action,
@@ -1000,6 +1351,8 @@ Create an operational report with exactly these sections as ## headings (use the
         "destination": destination,
         "budget": budget,
         "payment": payment,
+        "incoterm": incoterm,
+        "fx": fx_text,
         "notes": notes,
         "result": result
     }
@@ -1008,13 +1361,18 @@ Create an operational report with exactly these sections as ## headings (use the
 
 if st.session_state.get("show_latest_result") and st.session_state.last_trade_case:
     st.markdown(f'<div class="section-title">{T["result"]}</div>', unsafe_allow_html=True)
+    tc_now = st.session_state.last_trade_case
+    if involves_iran(tc_now.get("origin", ""), tc_now.get("destination", "")):
+        st.warning("⚠️ مبدأ/مقصد ایران است: روش پرداخت (به‌ویژه LC)، بانک‌های درگیر، تحریم‌ها و محدودیت‌های صادرات/واردات باید پیش از معامله با بانک، کارگزار گمرکی و مشاور حقوقی تأیید شود. این اپ آن‌ها را تأیید نمی‌کند."
+                   if st.session_state.language == "FA" else
+                   "⚠️ Iran is the origin/destination: the payment method (especially an LC), the banks involved, sanctions and export/import restrictions must be verified with your bank, a customs broker and legal counsel before any deal. This app does not confirm them.")
     with st.container(border=True):
         provider = st.session_state.last_provider or "Demo"
         model = st.session_state.last_model or ""
         st.caption(f"🤖 AI Provider: {provider} • {model}" if model else f"🤖 AI Provider: {provider}")
         if st.session_state.fallback_note:
             st.caption(f"↪ fallback used — {st.session_state.fallback_note}")
-        st.markdown(st.session_state.last_trade_case["result"])
+        st.markdown(tc_now["result"])
     mp = st.session_state.get("market_price_result")
     if mp and mp.get("text"):
         with st.expander("📊 Market price research / تحقیق قیمت بازار"):
@@ -1025,26 +1383,31 @@ if st.session_state.get("show_latest_result") and st.session_state.last_trade_ca
 
 # -------------------------- calculator ------------------------
 st.markdown(f'<div class="section-title">{T["pricing_title"]}</div>', unsafe_allow_html=True)
+st.caption("💡 برای فروش FOB/CIF/CFR به خریدار خارجی، حقوق گمرکی و مالیات واردات کشور مقصد معمولاً با خریدار است؛ این دو را فقط برای قیمت DDP پر کنید. VAT واردات هم برای ثبت‌نام‌شدگان اغلب قابل بازیافت است."
+           if st.session_state.language == "FA" else
+           "💡 For FOB/CIF/CFR sales to a foreign buyer, destination import duty and VAT are normally the buyer's cost; fill them only for DDP quotes. Import VAT is often recoverable for registered importers.")
 mp_calc = st.session_state.get("market_price_result")
 if mp_calc and mp_calc.get("data"):
     d = mp_calc["data"]
     st.caption(f"Market benchmark (unverified, from search sources): USD {d['low']:,.2f} – {d['high']:,.2f} per kg. Enter YOUR actual purchase price below.")
 q1, q2, q3 = st.columns(3)
 with q1:
+    calc_cur = st.selectbox(T["calc_currency"], CURRENCIES, key="calc_cur")
     calc_qty = st.text_input(T["quantity"], key="calc_qty")
-    calc_unit = st.text_input(T["purchase_unit"], placeholder="مثال: 80 USD/kg", key="calc_unit")
+    calc_unit = st.text_input(T["purchase_unit"], placeholder="مثال: 80", key="calc_unit")
     calc_inland = st.text_input(T["inland"], key="calc_inland")
-    calc_freight = st.text_input(T["freight"], key="calc_freight")
 with q2:
+    calc_freight = st.text_input(T["freight"], key="calc_freight")
     calc_ins = st.text_input(T["insurance"], key="calc_ins")
     calc_duty = st.text_input(T["duty"], key="calc_duty")
     calc_vat = st.text_input(T["vat"], key="calc_vat")
-    calc_bank = st.text_input(T["bank"], key="calc_bank")
 with q3:
+    calc_bank = st.text_input(T["bank"], key="calc_bank")
     calc_other = st.text_input(T["other"], key="calc_other")
     calc_margin = st.text_input(T["margin"], key="calc_margin")
     if st.button(T["calculate"], type="secondary", use_container_width=True):
-        calc, err = calculate_price(calc_qty, calc_unit, calc_inland, calc_freight, calc_ins, calc_duty, calc_vat, calc_bank, calc_other, calc_margin)
+        calc, err = calculate_price(calc_qty, calc_unit, calc_inland, calc_freight, calc_ins, calc_duty, calc_vat,
+                                    calc_bank, calc_other, calc_margin, calc_cur, st.session_state.language)
         st.session_state.calc_result = (None, err) if err else (calc, None)
 
 if st.session_state.calc_result:
@@ -1092,7 +1455,7 @@ if st.session_state.research_result:
 
 # ---------------------- invoice & document center with email & whatsapp ----------------------
 st.markdown('<div class="section-title">Invoice & Dispatch Center / صدور پیش‌فاکتور و ارسال به مشتری</div>', unsafe_allow_html=True)
-st.caption("صدور پیش‌فاکتور رسمی، دانلود PDF و ارسال به ایمیل یا واتساپ مشتری. متن‌های داخل PDF باید انگلیسی باشند.")
+st.caption("صدور پیش‌فاکتور یا سفارش خرید، دانلود PDF و ارسال به ایمیل یا واتساپ. متن‌های داخل PDF باید انگلیسی باشند.")
 
 last_case = st.session_state.get("last_trade_case") or {}
 
@@ -1101,86 +1464,98 @@ def safe_default(v: str) -> str:
     return v if pdf_safe(v) else ""
 
 
+_hs_hit = lookup_hs(last_case.get("product", ""))
+_inc_default = last_case.get("incoterm", "")
+_inc_options = [""] + INCOTERMS
+
 with st.form("invoice_form"):
     inv_cols = st.columns(2)
     with inv_cols[0]:
-        inv_type = st.selectbox("نوع سند", ["Proforma Invoice — Buyer", "Purchase Order — Supplier"])
+        inv_type = st.selectbox("نوع سند", ["Proforma Invoice (Buyer)", "Purchase Order (Supplier)"])
         inv_no = st.text_input("شماره سند", value=f"MA-{date.today().strftime('%Y%m%d')}-001")
-        inv_seller = st.text_input("فروشنده / صادرکننده (English)", value="Mehr Ara")
-        inv_buyer = st.text_input("نام خریدار / شرکت مقابل (English)")
+        inv_seller = st.text_input("صادرکننده سند / Issuer (English)", value="Mehr Ara")
+        inv_seller_addr = st.text_input("آدرس صادرکننده (English)")
+        inv_buyer = st.text_input("نام طرف مقابل: خریدار یا تأمین‌کننده (English)")
         inv_product = st.text_input("شرح کالا (English)", value=safe_default(last_case.get("product", "")))
+        inv_origin_country = st.text_input("کشور مبدأ کالا (English)", placeholder="Iran")
         customer_email = st.text_input("ایمیل مشتری (برای ارسال خودکار)", placeholder="client@example.com")
     with inv_cols[1]:
         inv_qty = st.text_input("مقدار و واحد", value=safe_default(last_case.get("quantity", "")))
         inv_unit_price = st.text_input("قیمت هر واحد (USD)", value="")
+        inv_hs = st.text_input("HS Code (candidate — verify)", value=(_hs_hit["code"] if _hs_hit else ""))
         customer_phone = st.text_input("شماره واتساپ مشتری (با کد کشور)", placeholder="+96891234567")
-        inv_incoterm = st.selectbox("Incoterm", ["EXW", "FCA", "FOB", "CFR", "CIF", "DAP", "DDP"], index=4)
+        inv_incoterm = st.selectbox("Incoterm", _inc_options, index=_inc_options.index(_inc_default) if _inc_default in _inc_options else 0,
+                                    format_func=lambda x: x if x else "—")
         inv_payment = st.text_input("شرایط پرداخت (الزامی، English)", value=safe_default(last_case.get("payment", "")))
-        inv_validity = st.text_input("اعتبار پیش‌فاکتور", value="7 days")
+        inv_validity = st.text_input("اعتبار سند (مثلاً 7 days)", value="7 days")
+        inv_bank = st.text_area("اطلاعات بانکی (اختیاری، English)", height=80)
 
-    inv_confirm = st.checkbox("اطلاعات پیش‌فاکتور، مشخصات کالا و قیمت‌ها را بازبینی و تایید می‌کنم.")
-    inv_submit = st.form_submit_button("تولید نهایی پیش‌فاکتور و آماده‌سازی ارسال", type="primary", use_container_width=True)
+    inv_confirm = st.checkbox("اطلاعات سند، مشخصات کالا و قیمت‌ها را بازبینی و تایید می‌کنم.")
+    inv_submit = st.form_submit_button("تولید نهایی سند و آماده‌سازی ارسال", type="primary", use_container_width=True)
 
 if inv_submit:
     qv = parse_number(inv_qty)
     uv = parse_number(inv_unit_price)
     pdf_fields = {
-        "document type": inv_type, "document no.": inv_no, "seller": inv_seller, "buyer": inv_buyer,
-        "product": inv_product, "quantity": inv_qty, "payment terms": inv_payment, "validity": inv_validity,
+        "document type": inv_type, "document no.": inv_no, "issuer": inv_seller, "issuer address": inv_seller_addr,
+        "counterparty": inv_buyer, "product": inv_product, "country of origin": inv_origin_country,
+        "quantity": inv_qty, "HS code": inv_hs, "payment terms": inv_payment, "validity": inv_validity, "bank details": inv_bank,
     }
     non_latin = [k for k, v in pdf_fields.items() if not pdf_safe(v)]
     if not inv_confirm:
-        st.error("لطفاً تایید اطلاعات پیش‌فاکتور را علامت بزنید.")
+        st.error("لطفاً تایید اطلاعات سند را علامت بزنید.")
     elif not inv_product.strip() or not inv_buyer.strip() or qv is None or uv is None or qv <= 0 or uv < 0:
-        st.error("شرح کالا، نام خریدار، مقدار و قیمت واحد معتبر الزامی است.")
+        st.error("شرح کالا، نام طرف مقابل، مقدار و قیمت واحد معتبر الزامی است.")
     elif not inv_payment.strip():
         st.error("شرایط پرداخت را خودتان مشخص کنید (به‌صورت پیش‌فرض فرض نمی‌شود).")
+    elif not inv_incoterm:
+        st.error("Incoterm را انتخاب کنید (به‌صورت پیش‌فرض فرض نمی‌شود).")
     elif non_latin:
-        st.error("PDF فقط حروف انگلیسی را پشتیبانی می‌کند. این فیلدها را انگلیسی بنویسید: " + ", ".join(non_latin))
+        st.error("PDF فقط حروف انگلیسی (Latin) را پشتیبانی می‌کند. این فیلدها را انگلیسی بنویسید: " + ", ".join(non_latin))
     else:
         total = qv * uv
-        buf = BytesIO()
-        pdf = canvas.Canvas(buf, pagesize=A4)
-        width, height = A4
-        pdf.setTitle(inv_no)
-        pdf.setFont("Helvetica-Bold", 18)
-        pdf.drawString(48, height - 55, "MEHR ARA COMMERCIAL")
-        pdf.setFont("Helvetica-Bold", 14)
-        pdf.drawString(48, height - 85, inv_type)
-        pdf.setFont("Helvetica", 10)
+        is_po = inv_type.startswith("Purchase")
+        doc_name = "Purchase Order" if is_po else "Proforma Invoice"
+        vu = valid_until(inv_validity)
         rows = [
             ("Document No.", inv_no), ("Date", date.today().isoformat()),
-            ("Seller", inv_seller), ("Buyer", inv_buyer),
-            ("Product", inv_product), ("Quantity", inv_qty),
-            ("Unit Price", f"USD {uv:,.2f}"), ("Total Goods Value", f"USD {total:,.2f}"),
-            ("Incoterm", inv_incoterm), ("Payment Terms", inv_payment),
-            ("Validity", inv_validity),
+            ("Buyer (issuer)" if is_po else "Seller", inv_seller),
         ]
-        y = height - 125
-        for label, value in rows:
-            pdf.setFont("Helvetica-Bold", 10)
-            pdf.drawString(48, y, label + ":")
-            pdf.setFont("Helvetica", 10)
-            pdf.drawString(180, y, str(value)[:95])
-            y -= 25
-        pdf.save()
-        st.session_state["generated_pdf"] = buf.getvalue()
+        if inv_seller_addr.strip():
+            rows.append(("Address", inv_seller_addr))
+        rows += [
+            ("Supplier" if is_po else "Buyer", inv_buyer),
+            ("Product", inv_product), ("Quantity", inv_qty),
+        ]
+        if inv_origin_country.strip():
+            rows.append(("Country of Origin", inv_origin_country))
+        if inv_hs.strip():
+            rows.append(("HS Code (candidate)", inv_hs))
+        rows += [
+            ("Unit Price", f"USD {uv:,.2f}"), ("Total Goods Value", f"USD {total:,.2f}"),
+            ("Amount in Words", amount_in_words(total)),
+            ("Incoterm", inv_incoterm), ("Payment Terms", inv_payment),
+            ("Validity", inv_validity + (f" (until {vu})" if vu else "")),
+        ]
+        if inv_bank.strip():
+            rows.append(("Bank Details", inv_bank))
+        st.session_state["generated_pdf"] = make_pdf({"no": inv_no, "type": doc_name, "rows": rows})
         st.session_state["inv_details"] = {
-            "no": inv_no, "buyer": inv_buyer, "total": total,
+            "no": inv_no, "buyer": inv_buyer, "total": total, "doc_name": doc_name, "is_po": is_po,
             "email": customer_email.strip(), "phone": customer_phone, "product": inv_product
         }
-        st.success(f"پیش‌فاکتور {inv_no} با موفقیت آماده شد! کل مبلغ: USD {total:,.2f}")
+        st.success(f"سند {inv_no} با موفقیت آماده شد! کل مبلغ: USD {total:,.2f}")
 
 if "generated_pdf" in st.session_state and st.session_state.get("inv_details"):
     det = st.session_state["inv_details"]
     st.markdown("---")
-    st.markdown("### 📤 ارسال و دانلود پیش‌فاکتور")
+    st.markdown("### 📤 ارسال و دانلود سند")
 
     col_dl, col_em, col_wa = st.columns(3)
 
     with col_dl:
         st.download_button(
-            "📥 دانلود فایل PDF پیش‌فاکتور",
+            "📥 دانلود فایل PDF",
             data=st.session_state["generated_pdf"],
             file_name=f"{det['no']}.pdf",
             mime="application/pdf",
@@ -1188,8 +1563,10 @@ if "generated_pdf" in st.session_state and st.session_state.get("inv_details"):
         )
 
     with col_em:
-        if st.button("📧 ارسال پیش‌فاکتور به ایمیل", use_container_width=True):
-            if not det["email"] or not EMAIL_RE.fullmatch(det["email"]):
+        if st.button("📧 ارسال به ایمیل", use_container_width=True):
+            if st.session_state.emails_sent >= 5:
+                st.error("سقف ارسال ایمیل در این نشست (۵ عدد) پر شده است.")
+            elif not det["email"] or not EMAIL_RE.fullmatch(det["email"]):
                 st.error("ایمیل مشتری را درست وارد کنید.")
             else:
                 try:
@@ -1203,24 +1580,28 @@ if "generated_pdf" in st.session_state and st.session_state.get("inv_details"):
                         st.error("تنظیمات SMTP (ایمیل فرستنده، نام کاربری و رمز عبور) در Secrets تنظیم نشده است.")
                     else:
                         msg = EmailMessage()
-                        msg["Subject"] = f"Proforma Invoice {det['no']} - Mehr Ara"
+                        msg["Subject"] = f"{det['doc_name']} {det['no']} - Mehr Ara"
                         msg["From"] = sender_email
                         msg["To"] = det["email"]
-                        msg.set_content(f"Dear {det['buyer']},\n\nPlease find attached the Proforma Invoice {det['no']} for {det['product']}.\nTotal Amount: USD {det['total']:,.2f}.\n\nBest regards,\nMehr Ara Trade Team")
+                        msg.set_content(f"Dear {det['buyer']},\n\nPlease find attached the {det['doc_name']} {det['no']} for {det['product']}.\nTotal Amount: USD {det['total']:,.2f}.\n\nBest regards,\nMehr Ara Trade Team")
                         msg.add_attachment(st.session_state["generated_pdf"], maintype="application", subtype="pdf", filename=f"{det['no']}.pdf")
 
-                        with smtplib.SMTP(smtp_server, smtp_port, timeout=30) as server:
-                            server.starttls()
+                        smtp_cls = smtplib.SMTP_SSL if smtp_port == 465 else smtplib.SMTP
+                        with smtp_cls(smtp_server, smtp_port, timeout=30) as server:
+                            if smtp_port != 465:
+                                server.starttls()
                             server.login(smtp_user, smtp_pass)
                             server.send_message(msg)
-                        st.success(f"پیش‌فاکتور با موفقیت به ایمیل {det['email']} ارسال شد!")
+                        st.session_state.emails_sent += 1
+                        st.success(f"سند با موفقیت به ایمیل {det['email']} ارسال شد!")
                 except Exception as e:
                     st.error(f"خطا در ارسال ایمیل: {e}")
 
     with col_wa:
         clean_phone = re.sub(r"\D", "", det["phone"] or "")
         if clean_phone:
-            wa_msg = quote_plus(f"سلام {det['buyer']} عزیز، پیش‌فاکتور شماره {det['no']} به مبلغ USD {det['total']:,.2f} برای کالا ({det['product']}) صادر شد. فایل پیش‌فاکتور را جداگانه برایتان ارسال می‌کنم. - گروه بازرگانی مهرآرا")
+            fa_name = "سفارش خرید" if det["is_po"] else "پیش‌فاکتور"
+            wa_msg = quote_plus(f"سلام {det['buyer']} عزیز، {fa_name} شماره {det['no']} به مبلغ USD {det['total']:,.2f} برای کالا ({det['product']}) صادر شد. فایل PDF را جداگانه برایتان ارسال می‌کنم. - گروه بازرگانی مهرآرا")
             st.link_button("💬 باز کردن واتساپ با پیام آماده", f"https://wa.me/{clean_phone}?text={wa_msg}", use_container_width=True)
             st.caption("واتساپ فقط متن را پیش‌پر می‌کند؛ فایل PDF را بعد از باز شدن گفتگو دستی پیوست کنید.")
         else:
@@ -1240,12 +1621,15 @@ if user_message:
     if st.session_state.last_trade_case:
         tc = st.session_state.last_trade_case
         context = (f"Current case: Product={tc['product']}; Quantity={tc['quantity']}; Origin={tc['origin']}; "
-                   f"Destination={tc['destination']}; Payment terms={tc.get('payment') or 'not specified'}")
+                   f"Destination={tc['destination']}; Incoterm={tc.get('incoterm') or 'not specified'}; "
+                   f"Payment terms={tc.get('payment') or 'not specified'}")
     prior = st.session_state.chat_history[:-1][-8:]
     answer = call_ai(f"{context}\n{hs_instruction((st.session_state.last_trade_case or {}).get('product', ''))}\nUser follow-up: {user_message}",
-                     st.session_state.language, prior, web_search=bool(groq_ready))
-    allowed_chat = context + " " + " ".join(m["content"] for m in st.session_state.chat_history if m["role"] == "user")
-    answer = scrub_unverified(answer, allowed_chat, scrub_links=False)
+                     st.session_state.language, prior, web_search=False)
+    allowed_chat = " ".join([context, st.session_state.get("research_result") or "",
+                             (st.session_state.last_trade_case or {}).get("result", "")]
+                            + [m["content"] for m in st.session_state.chat_history if m["role"] == "user"])
+    answer = scrub_unverified(answer, allowed_chat, URL_RE.findall(allowed_chat), scrub_links=True)
     st.session_state.chat_history.append({"role": "assistant", "content": answer})
     st.rerun()
 
