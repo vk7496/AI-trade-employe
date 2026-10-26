@@ -182,7 +182,8 @@ def pdf_safe(value: str) -> bool:
 # ---------------- output cleaning / anti-fabrication guards ----------------
 def clean_output(text: str) -> str:
     """Remove raw HTML (e.g. <br>) that Streamlit would show literally."""
-    text = re.sub(r"<br\s*/?>", " / ", text or "", flags=re.I)
+    text = re.sub(r"【[^】]*】", "", text or "")
+    text = re.sub(r"<br\s*/?>", " / ", text, flags=re.I)
     text = re.sub(
         r"</?(?:p|div|span|b|i|u|strong|em|ul|ol|li|table|thead|tbody|tr|td|th|center|font|small|sup|sub)\b[^>]*>",
         "", text, flags=re.I,
@@ -480,18 +481,26 @@ def format_search_results(results: List[Dict[str, str]]) -> str:
 
 
 def sources_table(results: List[Dict[str, str]], language: str) -> str:
-    def esc(s: str, n: int = 160) -> str:
-        return (s or "").replace("|", "/").replace("\n", " ")[:n]
+    def esc(x: str, n: int = 160) -> str:
+        return (x or "").replace("|", "/").replace("\n", " ").replace("[", "(").replace("]", ")")[:n]
 
     if language == "FA":
-        head = "| # | عنوان | دامنه | لینک | خلاصه منبع |\n|---|---|---|---|---|\n"
+        head = "| # | منبع | خلاصه |\n|---|---|---|\n"
     else:
-        head = "| # | Title | Domain | Link | Source snippet |\n|---|---|---|---|---|\n"
+        head = "| # | Source | Snippet |\n|---|---|---|\n"
     rows = []
     for i, r in enumerate(results, 1):
         host = urlparse(r["url"]).netloc.removeprefix("www.")
-        rows.append(f"| {i} | {esc(r['title'], 90)} | {host} | [open]({r['url']}) | {esc(r.get('snippet', ''))} |")
+        rows.append(f"| {i} | [{esc(r['title'], 80)}]({r['url']}) ({host}) | {esc(r.get('snippet', ''))} |")
     return head + "\n".join(rows)
+
+
+def filter_relevant(results: List[Dict[str, str]], keywords: List[str]) -> List[Dict[str, str]]:
+    """Keep only results whose title/snippet mention the product (any keyword)."""
+    keys = [k.strip().lower() for k in keywords if k and k.strip()]
+    if not keys:
+        return results
+    return [r for r in results if any(k in f"{r.get('title','')} {r.get('snippet','')}".lower() for k in keys)]
 
 
 # ---------------- AI ----------------
@@ -682,14 +691,26 @@ def run_live_research(mode: str, product: str, market: str, language: str, ai_re
     """Returns (markdown, number_of_sources). Never fabricates: if search returns nothing, says so."""
     product = (product or "").strip()
     market = (market or "").strip() or "Oman"
+    hit = lookup_hs(product)
+    pq = hit["name"] if hit else product  # English name searches far better than Persian
     if mode == "buyers":
-        queries = [f"{product} importer distributor buyer {market}", f"{product} wholesale import company {market}"]
+        queries = [f"{pq} importer distributor buyer {market}", f"{pq} wholesale import company {market}"]
     elif mode == "suppliers":
-        queries = [f"{product} exporter producer supplier {market}", f"{product} manufacturer wholesale {market}"]
+        queries = [f"{pq} exporter producer supplier {market}", f"{pq} manufacturer wholesale {market}"]
     else:
-        queries = [f"{market} customs import requirements {product}", f"{market} import permit {product} ministry official"]
+        queries = [f"{market} customs import requirements {pq}", f"{market} import permit {pq} ministry official"]
 
-    results = multi_search(queries, limit=10)
+    raw_results = multi_search(queries, limit=12)
+    results = raw_results
+    dropped = 0
+    if mode in ("buyers", "suppliers") and raw_results:
+        results = filter_relevant(raw_results, [product] + ([hit["name"]] if hit else []))
+        dropped = len(raw_results) - len(results)
+        if not results:
+            msg = ("نتایج پیدا شد ولی هیچ‌کدام به این کالا اشاره نمی‌کردند، پس چیزی نمایش داده نمی‌شود. نام کالا را دقیق‌تر (ترجیحاً انگلیسی) بنویسید یا بازار را تغییر دهید."
+                   if language == "FA" else
+                   "Results were found but none mentioned this product, so nothing is shown. Try a more specific (English) product name or another market.")
+            return msg, 0
     if not results:
         msg = ("جست‌وجوی وب در این اجرا هیچ نتیجه‌ای بازیابی نکرد، بنابراین **هیچ شرکت یا اطلاعات تماسی نمایش داده نمی‌شود** (چیزی ساخته نشد). "
                "برای نتیجه پایدارتر، `TAVILY_API_KEY` را در Secrets اضافه کنید."
@@ -702,6 +723,9 @@ def run_live_research(mode: str, product: str, market: str, language: str, ai_re
     engine = st.session_state.get("search_engine") or "web"
     heading = "### منابع بازیابی‌شده" if language == "FA" else "### Retrieved sources"
     table = f"{heading} ({engine})\n" + sources_table(results, language)
+    if dropped:
+        table += (f"\n\n_{dropped} نتیجه نامرتبط (بدون اشاره به کالا) حذف شد._" if language == "FA"
+                  else f"\n\n_{dropped} irrelevant results (not mentioning the product) were hidden._")
     if not ai_ready:
         return table, len(results)
 
@@ -709,7 +733,8 @@ def run_live_research(mode: str, product: str, market: str, language: str, ai_re
         task = ("Return a markdown table: Organization | Type | What the source says | Source # | Confidence (High/Medium/Low). "
                 "List ONLY organizations that are named in the sources. If a source is only an article, directory or marketplace, say so. "
                 "Do NOT output emails, phone numbers or addresses unless they appear verbatim in a snippet. "
-                "End with short 'next verification steps'.")
+                "Give 'High' confidence ONLY if the snippet shows the organization actually trades this product; otherwise Low. "
+                "Do not merge details of different sources into one organization. End with short 'next verification steps'.")
     else:
         task = ("Summarize import/customs requirements ONLY where a snippet explicitly supports them, citing Source #. "
                 "List everything else as 'must verify with the official customs authority'. "
@@ -926,6 +951,16 @@ if st.button(T["generate"], type="primary", use_container_width=True):
             if parsed_q:
                 st.session_state["calc_qty"] = str(parsed_q)
 
+    if st.session_state.language == "FA":
+        sec = ["خلاصه مدیریتی", "حقایق در برابر فرضیات", "قیمت مرجع بازار و Incoterm", "راهبرد خریدار و تأمین‌کننده",
+               "چک‌لیست گمرک، HS Code و انطباق واردات", "برنامه عملیاتی ۵ تا ۷ روزه", "پیش‌نویس RFQ / پیام تجاری"]
+        status = "تأییدشده با منبع / باید تأیید شود / اعلام‌شده توسط کاربر"
+        missing = "باید توسط کاربر مشخص شود"
+    else:
+        sec = ["Executive summary", "Known facts vs assumptions", "Market price benchmark and Incoterm", "Buyer and supplier strategy",
+               "Customs, HS Code and import-compliance checklist", "5-7 day action plan", "Draft RFQ / commercial message"]
+        status = "verified-by-source / must-verify / user-provided"
+        missing = "must be specified by the user"
     prompt = f"""Trade case for Mehr Ara:
 Workflow: {st.session_state.selected_action}
 Product: {product or 'Not provided'}
@@ -943,14 +978,14 @@ LIVE MARKET PRICE RESEARCH:
 
 {clean_farsi_prompt(st.session_state.language)}
 
-Create an operational report with these sections (## headings, no numbers):
-- Executive summary
-- Known facts vs assumptions (table; mark every missing input as 'must be specified by the user')
-- Market price benchmark (only from the research above) and Incoterm discussion
-- Buyer/supplier strategy: describe TYPES of buyers/suppliers and channels only. Do NOT name specific companies, emails or phones here — named leads come only from the Live Trade Research section.
-- Customs, HS Code (use HS_REFERENCE only) and import-compliance checklist for the destination, marking each item as verified-by-source or must-verify
-- 5-7 day action plan
-- Draft RFQ/commercial message
+Create an operational report with exactly these sections as ## headings (use these exact titles, no numbers):
+## {sec[0]}
+## {sec[1]} (table; mark every missing input as '{missing}')
+## {sec[2]} (only from the research above)
+## {sec[3]}: describe TYPES of buyers/suppliers and channels only. Do NOT name specific companies, emails or phones here — named leads come only from the Live Trade Research section.
+## {sec[4]} (use HS_REFERENCE only; mark each item with one status: {status})
+## {sec[5]}
+## {sec[6]}
 """
     with st.spinner(T["working"]):
         result = call_ai(prompt, st.session_state.language, web_search=bool(groq_ready))
